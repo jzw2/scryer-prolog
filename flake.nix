@@ -16,6 +16,7 @@
           src = ./.;
       nativeBuildInputs = with pkgs; [ pkg-config ];
         buildInputs = with pkgs; [ openssl gmp libmpc mpfr
+                                   libffi
                           gnum4];
         };
         devShell = with pkgs; mkShell {
