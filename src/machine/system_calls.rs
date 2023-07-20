@@ -9,7 +9,7 @@ use crate::forms::*;
 use crate::ffi::*;
 use crate::heap_iter::*;
 use crate::heap_print::*;
-use crate::http::{self, HttpListener, HttpResponse};
+use crate::http::{HttpService, HttpListener, HttpResponse};
 use crate::instructions::*;
 use crate::machine;
 use crate::machine::{Machine, VERIFY_ATTR_INTERRUPT_LOC, get_structure_index};
@@ -39,7 +39,7 @@ use ref_thread_local::{RefThreadLocal, ref_thread_local};
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::convert::{TryFrom, Infallible};
+use std::convert::{TryFrom};
 use std::env;
 use std::ffi::CString;
 use std::fs;
@@ -51,9 +51,7 @@ use std::net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::ops::Sub;
 use std::process;
-use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use chrono::{offset::Local, DateTime};
 use cpu_time::ProcessTime;
@@ -81,13 +79,12 @@ use base64;
 use roxmltree;
 use select;
 
-use hyper::{Body, Server, Client, HeaderMap, Method, Request, Response, Uri};
-use hyper::header::{HeaderName, HeaderValue};
-use hyper::body::Buf;
-use hyper::service::{make_service_fn, service_fn};
-use hyper_tls::HttpsConnector;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::channel;
+use hyper::server::conn::http1;
+use hyper::header::{HeaderValue, HeaderName};
+use hyper::{HeaderMap, Method};
+use http_body_util::BodyExt;
+use bytes::Buf;
+use reqwest::Url;
 
 ref_thread_local! {
     pub(crate) static managed RANDOM_STATE: RandState<'static> = RandState::new();
@@ -121,6 +118,7 @@ pub struct BrentAlgState {
     pub power: usize,
     pub lam: usize,
     pub pstr_chars: usize,
+    max_steps: i64,
 }
 
 impl BrentAlgState {
@@ -131,6 +129,7 @@ impl BrentAlgState {
             power: 1,
             lam: 0,
             pstr_chars: 0,
+            max_steps: -1,
         }
     }
 
@@ -162,76 +161,111 @@ impl BrentAlgState {
         return self.lam + self.pstr_chars + self.power - 1;
     }
 
+    #[inline(always)]
+    pub fn exhausted_max_steps(&self) -> bool {
+        self.max_steps > -1 && self.num_steps() as i64 >= self.max_steps
+    }
+
     pub fn to_result(mut self, heap: &[HeapCellValue]) -> CycleSearchResult {
+        /*
         if let Some(var) = heap[self.hare].as_var() {
             return CycleSearchResult::PartialList(self.num_steps(), var);
         }
+        */
 
-        read_heap_cell!(heap[self.hare],
-            (HeapCellValueTag::PStrOffset) => {
-                let n = cell_as_fixnum!(heap[self.hare+1]).get_num() as usize;
+        loop {
+            read_heap_cell!(heap[self.hare],
+                (HeapCellValueTag::PStrOffset) => {
+                    let (pstr_loc, offset) = pstr_loc_and_offset(heap, self.hare);
+                    let offset = offset.get_num() as usize;
 
-                let pstr = cell_as_string!(heap[self.hare]);
-                self.pstr_chars += pstr.as_str_from(n).chars().count();
+                    let pstr = cell_as_string!(heap[self.hare]);
+                    self.pstr_chars += pstr.as_str_from(offset).chars().count();
 
-                return CycleSearchResult::PStrLocation(self.num_steps(), n);
-            }
-            (HeapCellValueTag::Atom, (name, arity)) => {
-                return if name == atom!("[]") && arity == 0 {
-                    CycleSearchResult::ProperList(self.num_steps())
-                } else {
-                    CycleSearchResult::NotList(self.num_steps(), heap[self.hare])
-                };
-            }
-            (HeapCellValueTag::Str, s) => {
-                let (name, arity) = cell_as_atom_cell!(heap[s])
-                    .get_name_and_arity();
+                    return CycleSearchResult::PStrLocation(self.num_steps(), pstr_loc, offset);
+                }
+                (HeapCellValueTag::PStrLoc, l) => {
+                    let (_pstr_loc, offset) = pstr_loc_and_offset(heap, l);
+                    let offset = offset.get_num() as usize;
+                    return CycleSearchResult::PStrLocation(self.num_steps(), l, offset);
+                }
+                (HeapCellValueTag::Atom, (name, arity)) => {
+                    return if name == atom!("[]") && arity == 0 {
+                        CycleSearchResult::ProperList(self.num_steps())
+                    } else {
+                        CycleSearchResult::NotList(self.num_steps(), heap[self.hare])
+                    };
+                }
+                (HeapCellValueTag::Str, s) => {
+                    let (name, arity) = cell_as_atom_cell!(heap[s])
+                        .get_name_and_arity();
 
-                return if name == atom!("[]") && arity == 0 {
-                    CycleSearchResult::ProperList(self.num_steps())
-                } else {
-                    CycleSearchResult::NotList(self.num_steps(), heap[self.hare])
-                };
-            }
-            (HeapCellValueTag::Lis, l) => {
-                return CycleSearchResult::UntouchedList(self.num_steps(), l);
-            }
-            _ => {
-                return CycleSearchResult::NotList(self.num_steps(), heap[self.hare]);
-            }
-        );
+                    return if name == atom!("[]") && arity == 0 {
+                        CycleSearchResult::ProperList(self.num_steps())
+                    } else {
+                        CycleSearchResult::NotList(self.num_steps(), heap[self.hare])
+                    };
+                }
+                (HeapCellValueTag::Lis, l) => {
+                    return CycleSearchResult::UntouchedList(self.num_steps(), l);
+                }
+                (HeapCellValueTag::AttrVar | HeapCellValueTag::Var, h) => {
+                    if h == self.hare {
+                        let var = heap[self.hare].as_var().unwrap();
+                        return CycleSearchResult::PartialList(self.num_steps(), var);
+                    } else {
+                        self.hare = h;
+                    }
+                }
+                _ => {
+                    return CycleSearchResult::NotList(self.num_steps(), heap[self.hare]);
+                }
+            );
+        }
     }
 
-    fn add_pstr_chars_and_step(&mut self, heap: &[HeapCellValue], h: usize) -> Option<CycleSearchResult> {
+    fn add_pstr_offset_chars(&mut self, heap: &[HeapCellValue], h: usize, offset: usize) -> Option<CycleSearchResult> {
         read_heap_cell!(heap[h],
             (HeapCellValueTag::CStr, cstr_atom) => {
                 let cstr = PartialString::from(cstr_atom);
+                let num_chars = cstr.as_str_from(offset).chars().count();
 
-                self.pstr_chars += cstr.as_str_from(0).chars().count();
-                Some(CycleSearchResult::ProperList(self.num_steps()))
+                if self.max_steps == -1 || self.num_steps() + num_chars < self.max_steps as usize {
+                    self.pstr_chars += num_chars;
+                    Some(CycleSearchResult::ProperList(self.num_steps()))
+                } else {
+                    let offset = self.num_steps() + num_chars - self.max_steps as usize;
+                    self.pstr_chars += offset;
+                    Some(CycleSearchResult::PStrLocation(self.max_steps as usize, h, offset))
+                }
             }
             (HeapCellValueTag::PStr, pstr_atom) => {
                 let pstr = PartialString::from(pstr_atom);
+                let num_chars = pstr.as_str_from(offset).chars().count();
 
-                self.pstr_chars += pstr.as_str_from(0).chars().count() - 1;
-                self.step(h+1)
-            }
-            (HeapCellValueTag::PStrOffset, offset) => {
-                let pstr = cell_as_string!(heap[offset]);
-                let n = cell_as_fixnum!(heap[h+1]).get_num() as usize;
-
-                self.pstr_chars += pstr.as_str_from(n).chars().count();
-
-                if let HeapCellValueTag::PStr = heap[offset].get_tag() {
-                    self.pstr_chars -= 1;
-                    self.step(offset+1)
+                if self.max_steps == -1 || self.num_steps() + num_chars < self.max_steps as usize {
+                    self.pstr_chars += num_chars - 1;
+                    self.step(h+1)
                 } else {
-                    debug_assert!(heap[offset].get_tag() == HeapCellValueTag::CStr);
-                    Some(CycleSearchResult::ProperList(self.num_steps()))
+                    let offset = self.num_steps() + num_chars - self.max_steps as usize;
+                    self.pstr_chars += offset;
+                    Some(CycleSearchResult::PStrLocation(self.max_steps as usize, h, offset))
                 }
             }
             _ => {
                 unreachable!()
+            }
+        )
+    }
+
+    fn add_pstr_chars_and_step(&mut self, heap: &[HeapCellValue], h: usize) -> Option<CycleSearchResult> {
+        read_heap_cell!(heap[h],
+            (HeapCellValueTag::PStrOffset, l) => {
+                let (pstr_loc, offset) = pstr_loc_and_offset(heap, l);
+                self.add_pstr_offset_chars(heap, pstr_loc, offset.get_num() as usize)
+            }
+            _ => {
+                self.add_pstr_offset_chars(heap, h, 0)
             }
         )
     }
@@ -389,7 +423,7 @@ impl BrentAlgState {
                 }
 
                 if pstr_chars + 1 > max_steps {
-                    return CycleSearchResult::PStrLocation(max_steps, h_offset);
+                    return CycleSearchResult::PStrLocation(max_steps, h_offset, max_steps);
                 }
 
                 h_offset+1
@@ -445,9 +479,10 @@ impl BrentAlgState {
 
         brent_st.power += 1; // advance a step.
         brent_st.pstr_chars = pstr_chars;
+        brent_st.max_steps = max_steps as i64;
 
         loop {
-            if brent_st.num_steps() >= max_steps {
+            if brent_st.exhausted_max_steps() {
                 return brent_st.to_result(&heap);
             }
 
@@ -639,8 +674,25 @@ impl MachineState {
         };
 
         match search_result {
-            CycleSearchResult::PStrLocation(steps, pstr_loc) => {
-                self.finalize_skip_max_list(steps as i64, pstr_loc_as_cell!(pstr_loc));
+            CycleSearchResult::PStrLocation(steps, pstr_loc, offset) => {
+                let steps = if max_steps > - 1 {
+                    std::cmp::min(max_steps, steps as i64)
+                } else {
+                    steps as i64
+                };
+
+                let cell = if offset > 0 {
+                    let h = self.heap.len();
+
+                    self.heap.push(pstr_offset_as_cell!(pstr_loc));
+                    self.heap.push(fixnum_as_cell!(Fixnum::build_with(offset as i64)));
+
+                    pstr_loc_as_cell!(h)
+                } else {
+                    pstr_loc_as_cell!(pstr_loc)
+                };
+
+                self.finalize_skip_max_list(steps, cell);
             }
             CycleSearchResult::UntouchedList(n, l) => {
                 self.finalize_skip_max_list(n as i64, list_loc_as_cell!(l));
@@ -748,7 +800,7 @@ impl MachineState {
         unify_fn!(*self, list_of_vars, outcome);
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn install_new_block(&mut self, value: HeapCellValue) -> usize {
         let value = self.store(self.deref(value));
 
@@ -832,75 +884,92 @@ impl MachineState {
         indices: &IndexStore,
         stub_gen: impl Fn() -> FunctorStub,
     ) -> CallResult {
+        use crate::parser::lexer::*;
+
         let nx = self.store(self.deref(self.registers[2]));
+        let add_dot = !string.ends_with(".");
+        let cursor = std::io::Cursor::new(string);
 
-        let mut charcode_space = false;
-        let mut cs = string.chars();
+        let iter = std::io::Read::chain(
+            cursor,
+            {
+                let mut dot_buf: [u8; '.'.len_utf8()] = [0u8];
 
-        loop {
-            let c = cs.next();
+                if add_dot {
+                    '.'.encode_utf8(&mut dot_buf);
+                }
 
-            if c == None {
-                break;
+                std::io::Cursor::new(dot_buf)
+            },
+        );
+
+        let mut lexer = Lexer::new(CharReader::new(iter), self);
+        let mut tokens = vec![];
+
+        match lexer.next_token() {
+            Ok(token @ Token::Literal(Literal::Atom(atom!("-")) | Literal::Char('-'))) => {
+                tokens.push(token);
+
+                if let Ok(token) = lexer.next_token() {
+                    tokens.push(token);
+                }
             }
-
-            if c == Some('0')
-                && cs.next() == Some('\'')
-                && cs.next() == Some(' ')
-                && cs.next() == None {
-                charcode_space = true;
-                break;
+            Ok(token) => {
+                tokens.push(token);
+            }
+            Err(err) => {
+                let err = self.syntax_error(err);
+                return Err(self.error_form(err, stub_gen()));
             }
         }
 
-        if !charcode_space {
-            if let Some(c) = string.chars().last() {
-                if layout_char!(c) {
-                    let (line_num, col_num) = string.chars().fold((0, 0), |(line_num, col_num), c| {
-                        if new_line_char!(c) {
-                            (1 + line_num, 0)
-                        } else {
-                            (line_num, col_num + 1)
+        loop {
+            match lexer.lookahead_char() {
+                Err(e) if e.is_unexpected_eof() => {
+                    let mut parser = Parser::from_lexer(lexer);
+                    let op_dir = CompositeOpDir::new(&indices.op_dir, None);
+
+                    tokens.reverse();
+
+                    match parser.read_term(&op_dir, Tokens::Provided(tokens)) {
+                        Err(err) => {
+                            let err = self.syntax_error(err);
+                            return Err(self.error_form(err, stub_gen()));
                         }
-                    });
+                        Ok(Term::Literal(_, Literal::Rational(n))) => {
+                            self.unify_rational(n, nx);
+                        }
+                        Ok(Term::Literal(_, Literal::Float(n))) => {
+                            self.unify_f64(n.as_ptr(), nx);
+                        }
+                        Ok(Term::Literal(_, Literal::Integer(n))) => {
+                            self.unify_big_int(n, nx);
+                        }
+                        Ok(Term::Literal(_, Literal::Fixnum(n))) => {
+                            self.unify_fixnum(n, nx);
+                        }
+                        _ => {
+                            let err = ParserError::ParseBigInt(0, 0);
+                            let err = self.syntax_error(err);
+
+                            return Err(self.error_form(err, stub_gen()));
+                        }
+                    }
+
+                    break;
+                }
+                Ok('.') => {
+                    lexer.skip_char('.');
+                }
+                Ok(c) => {
+                    let (line_num, col_num) = (lexer.line_num, lexer.col_num);
+
                     let err = ParserError::UnexpectedChar(c, line_num, col_num);
                     let err = self.syntax_error(err);
 
                     return Err(self.error_form(err, stub_gen()));
                 }
-            }
-        }
-
-        let mut dot_buf: [u8; '.'.len_utf8()] = [0u8];
-        '.'.encode_utf8(&mut dot_buf);
-
-        let cursor = std::io::Cursor::new(string);
-        let iter = std::io::Read::chain(cursor, std::io::Cursor::new(dot_buf));
-
-        let mut parser = Parser::new(CharReader::new(iter), self);
-
-        match parser.read_term(&CompositeOpDir::new(&indices.op_dir, None)) {
-            Err(err) => {
-                let err = self.syntax_error(err);
-                return Err(self.error_form(err, stub_gen()));
-            }
-            Ok(Term::Literal(_, Literal::Rational(n))) => {
-                self.unify_rational(n, nx);
-            }
-            Ok(Term::Literal(_, Literal::Float(n))) => {
-                self.unify_f64(n.as_ptr(), nx);
-            }
-            Ok(Term::Literal(_, Literal::Integer(n))) => {
-                self.unify_big_int(n, nx);
-            }
-            Ok(Term::Literal(_, Literal::Fixnum(n))) => {
-                self.unify_fixnum(n, nx);
-            }
-            _ => {
-                let err = ParserError::ParseBigInt(0, 0);
-                let err = self.syntax_error(err);
-
-                return Err(self.error_form(err, stub_gen()));
+                Err(_) => unreachable!(),
             }
         }
 
@@ -927,7 +996,7 @@ impl MachineState {
 
         self.p = cp + 1;
 
-        // adjust cut point to occur after call_continuation.
+        /*
         if num_cells > 0 {
             if let HeapCellValueTag::Fixnum = self.heap[s + 2].get_tag() {
                 and_frame[1] = fixnum_as_cell!(Fixnum::build_with(self.b as i64));
@@ -935,9 +1004,15 @@ impl MachineState {
                 and_frame[1] = self.heap[s + 2];
             }
         }
+        */
 
-        for index in s + 3..s + 2 + num_cells {
-            and_frame[index - (s + 1)] = self.heap[index];
+        for index in s + 2..s + 2 + num_cells {
+            if let HeapCellValueTag::CutPoint = self.heap[index].get_tag() {
+                // adjust cut point to occur after call_continuation.
+                and_frame[index - (s + 1)] = fixnum_as_cell!(Fixnum::as_cutpoint(self.b as i64));
+            } else {
+                and_frame[index - (s + 1)] = self.heap[index];
+            }
         }
 
         self.e = e;
@@ -1202,7 +1277,7 @@ impl Machine {
     }
 
     #[inline(always)]
-    pub(crate) fn deref_register(&mut self, i: usize) -> HeapCellValue {
+    pub(crate) fn deref_register(&self, i: usize) -> HeapCellValue {
 	    self.machine_st.store(self.machine_st.deref(self.machine_st.registers[i]))
     }
 
@@ -1358,10 +1433,15 @@ impl Machine {
                     post_supp_args
                         .zip(supp_vars.iter())
                         .all(|(arg_term, supp_var)| {
-                            let arg_term = self.machine_st.store(self.machine_st.deref(arg_term));
+                            let (module_loc, arg_term) = self.machine_st.strip_module(
+                                arg_term,
+                                heap_loc_as_cell!(0),
+                            );
 
-                            if arg_term.is_var() && supp_var.is_var() {
-                                return arg_term == *supp_var;
+                            if module_loc.is_var() || module_loc == atom_as_cell!(atom!("user")) {
+                                if arg_term.is_var() && supp_var.is_var() {
+                                    return arg_term == *supp_var;
+                                }
                             }
 
                             false
@@ -1445,7 +1525,7 @@ impl Machine {
 
             let vars: Vec<_> = vars
                 .union(&result.supp_vars) // difference + union does not cancel.
-                .map(|v| Term::Var(Cell::default(), Rc::new(format!("_{}", v.get_value()))))
+                .map(|v| Term::Var(Cell::default(), VarPtr::from(format!("_{}", v.get_value()))))
                 .collect();
 
             let helper_clause_loc = self.code.len();
@@ -1655,8 +1735,8 @@ impl Machine {
     #[inline(always)]
     pub(crate) fn is_reset_cont_marker(&self, p: usize) -> bool {
         match &self.code[p] {
-            &Instruction::CallResetContinuationMarker(_) |
-            &Instruction::ExecuteResetContinuationMarker(_) => true,
+            &Instruction::CallResetContinuationMarker |
+            &Instruction::ExecuteResetContinuationMarker => true,
             _ => false
         }
     }
@@ -2362,17 +2442,19 @@ impl Machine {
         let addr = self.deref_register(2);
 
         if stream.at_end_of_stream() {
-            stream.set_past_end_of_stream(true);
-
             self.machine_st.unify_fixnum(
                 Fixnum::build_with(-1),
                 addr,
             );
 
-            return Ok(());
+            if self.machine_st.fail {
+                self.machine_st.fail = false;
+            } else {
+                return Ok(());
+            }
         }
 
-         match addr {
+        let addr = match addr {
             addr if addr.is_var() => addr,
             addr => match Number::try_from(addr) {
                 Ok(Number::Integer(n)) => {
@@ -2402,6 +2484,7 @@ impl Machine {
             match stream.peek_byte().map_err(|e| e.kind()) {
                 Ok(b) => {
                     self.machine_st.unify_fixnum(Fixnum::build_with(b as i64), addr);
+                    break;
                 }
                 Err(ErrorKind::PermissionDenied) => {
                     self.machine_st.fail = true;
@@ -2458,7 +2541,6 @@ impl Machine {
 
         if stream.at_end_of_stream() {
             let end_of_file = atom!("end_of_file");
-            stream.set_past_end_of_stream(true);
 
             self.machine_st.unify_atom(
                 end_of_file,
@@ -2554,15 +2636,16 @@ impl Machine {
         let a2 = self.deref_register(2);
 
         if stream.at_end_of_stream() {
-            let end_of_file = atom!("end_of_file");
-            stream.set_past_end_of_stream(true);
-
-            self.machine_st.unify_atom(
-                end_of_file,
+            self.machine_st.unify_fixnum(
+                Fixnum::build_with(-1),
                 a2,
             );
 
-            return Ok(());
+            if self.machine_st.fail {
+                self.machine_st.fail = false;
+            } else {
+                return Ok(());
+            }
         }
 
         let addr = read_heap_cell!(a2,
@@ -2806,7 +2889,7 @@ impl Machine {
                 unreachable!()
             }
         );
-	
+
         self.machine_st.fail = true; // This predicate fails by default.
 
         read_heap_cell!(a2,
@@ -2869,12 +2952,12 @@ impl Machine {
 		macro_check!(symbolic_control_char, atom!("symbolic_control"));
 		method_check!(is_uppercase, atom!("upper"));
 		// macro_check!(variable_indicator_char, atom!("variable_indicator"));
-		method_check!(is_whitespace, atom!("whitespace"));		
+		method_check!(is_whitespace, atom!("whitespace"));
 	    }
             (HeapCellValueTag::Str, s) => {
 	        let (name, arity) = cell_as_atom_cell!(self.machine_st.heap[s])
 		    .get_name_and_arity();
-		
+
 		match (name, arity) {
 		    (atom!("to_upper"), 1) => {
 			let reg = self.machine_st.deref(self.machine_st.heap[s+1]);
@@ -2889,7 +2972,7 @@ impl Machine {
 			let lower_str = string_as_cstr_cell!(atom);
 			unify!(self.machine_st, reg, lower_str);
 			self.machine_st.fail = false;
-		    }		    
+		    }
 		    _ => {
 			unreachable!()
 		    }
@@ -2899,9 +2982,9 @@ impl Machine {
 	        unreachable!()
 	    }
 	);
-		
 
-        
+
+
     }
 
     #[inline(always)]
@@ -3027,9 +3110,10 @@ impl Machine {
         } else {
             read_heap_cell!(addr,
                 (HeapCellValueTag::Atom, (name, _arity)) => {
-                    let c = name.as_char().unwrap();
-                    write!(&mut stream, "{}", c).unwrap();
-                    return Ok(());
+                    if let Some(c) = name.as_char() {
+                        write!(&mut stream, "{}", c).unwrap();
+                        return Ok(());
+                    }
                 }
                 (HeapCellValueTag::Char, c) => {
                     write!(&mut stream, "{}", c).unwrap();
@@ -3065,7 +3149,7 @@ impl Machine {
                     }
 
                     bytes.push(c as u8);
-                }
+            }
             } else {
                 bytes = string.as_str().bytes().collect();
             }
@@ -3275,7 +3359,7 @@ impl Machine {
         }
 
         let stub_gen = || functor_stub(atom!("get_char"), 2);
-        let mut iter = self.machine_st.open_parsing_stream(stream, atom!("get_char"), 2)?;
+        let result = self.machine_st.open_parsing_stream(stream);
 
         let addr = if addr.is_var() {
             addr
@@ -3294,10 +3378,25 @@ impl Machine {
             )
         };
 
-        loop {
-            let result = iter.read_char();
+        let mut iter = match result {
+            Ok(iter) => iter,
+            Err(e) => {
+                if e.is_unexpected_eof() {
+                    return self.machine_st.eof_action(
+                        self.machine_st.registers[2],
+                        stream,
+                        atom!("get_char"),
+                        2,
+                    );
+                } else {
+                    let err = self.machine_st.session_error(SessionError::from(e));
+                    return Err(self.machine_st.error_form(err, stub_gen()));
+                }
+            }
+        };
 
-            match result {
+        loop {
+            match iter.read_char() {
                 Some(Ok(c)) => {
                     self.machine_st.unify_char(c, addr);
                     break;
@@ -3357,7 +3456,13 @@ impl Machine {
                 string.push(c as char);
             }
         } else {
-            let mut iter = self.machine_st.open_parsing_stream(stream, atom!("get_n_chars"), 2)?;
+            let mut iter = self.machine_st.open_parsing_stream(stream)
+                .map_err(|e| {
+                    let err = self.machine_st.session_error(SessionError::from(e));
+                    let stub = functor_stub(atom!("get_n_chars"), 2);
+
+                    self.machine_st.error_form(err, stub)
+                })?;
 
             for _ in 0..num {
                 let result = iter.read_char();
@@ -3455,7 +3560,13 @@ impl Machine {
             }
         };
 
-        let mut iter = self.machine_st.open_parsing_stream(stream.clone(), atom!("get_code"), 2)?;
+        let mut iter = self.machine_st.open_parsing_stream(stream)
+            .map_err(|e| {
+                let err = self.machine_st.session_error(SessionError::from(e));
+                let stub = functor_stub(atom!("get_code"), 2);
+
+                self.machine_st.error_form(err, stub)
+            })?;
 
         loop {
             let result = iter.read_char();
@@ -3690,12 +3801,25 @@ impl Machine {
 
     #[inline(always)]
     pub(crate) fn lookup_db_ref(&mut self) {
-        let name = cell_as_atom!(self.deref_register(1));
-        let arity = cell_as_fixnum!(self.deref_register(2)).get_num() as usize;
+        let module_name = self.deref_register(1);
+        let name = cell_as_atom!(self.deref_register(2));
+        let arity = cell_as_fixnum!(self.deref_register(3)).get_num() as usize;
 
-        if self.indices.code_dir.get(&(name, arity)).is_none() {
-            self.machine_st.fail = true;
-        }
+        let module_name = read_heap_cell!(module_name,
+            (HeapCellValueTag::Atom, (module_name, _arity)) => {
+                module_name
+            }
+            (HeapCellValueTag::AttrVar | HeapCellValueTag::Var) => {
+                atom!("user")
+            }
+            _ => {
+                unreachable!()
+            }
+        );
+
+        self.machine_st.fail = self.indices
+            .get_predicate_code_index(name, arity, module_name)
+            .is_none();
     }
 
     #[inline(always)]
@@ -3703,7 +3827,19 @@ impl Machine {
         let name_match: fn(Atom, Atom) -> bool;
         let arity_match: fn(usize, usize) -> bool;
 
-        let atom = self.deref_register(1);
+        let module_name = read_heap_cell!(self.deref_register(1),
+            (HeapCellValueTag::Atom, (module_name, _arity)) => {
+                module_name
+            }
+            (HeapCellValueTag::AttrVar | HeapCellValueTag::Var | HeapCellValueTag::StackVar) => {
+                atom!("user")
+            }
+            _ => {
+                unreachable!()
+            }
+        );
+
+        let atom = self.deref_register(2);
 
         let pred_atom = if atom.is_var() {
             name_match = |_, _| true;
@@ -3713,7 +3849,7 @@ impl Machine {
             cell_as_atom!(atom)
         };
 
-        let arity = self.deref_register(2);
+        let arity = self.deref_register(3);
 
         let pred_arity = if arity.is_var() {
             arity_match = |_, _| true;
@@ -3738,7 +3874,19 @@ impl Machine {
         let h = self.machine_st.heap.len();
         let mut num_functors = 0;
 
-        for (name, arity) in self.indices.code_dir.keys() {
+        let code_dir = if module_name == atom!("user") {
+            &self.indices.code_dir
+        } else {
+            match self.indices.modules.get(&module_name).map(|module| &module.code_dir) {
+                Some(code_dir) => code_dir,
+                None => {
+                    self.machine_st.fail = true;
+                    return;
+                }
+            }
+        };
+
+        for (name, arity) in code_dir.keys() {
             if name_match(pred_atom, *name) && arity_match(pred_arity, *arity) {
                 self.machine_st.heap.extend(
                     functor!(atom!("/"), [cell(atom_as_cell!(name)), fixnum(*arity)]),
@@ -3754,9 +3902,9 @@ impl Machine {
                 (0 .. num_functors).map(|i| str_loc_as_cell!(h + 3 * i)),
             );
 
-            unify!(self.machine_st, heap_loc_as_cell!(h), self.machine_st.registers[3]);
+            unify!(self.machine_st, heap_loc_as_cell!(h), self.machine_st.registers[4]);
         } else {
-            unify!(self.machine_st, empty_list_as_cell!(), self.machine_st.registers[3]);
+            unify!(self.machine_st, empty_list_as_cell!(), self.machine_st.registers[4]);
         }
     }
 
@@ -4087,63 +4235,65 @@ impl Machine {
         };
         if let Some(address_sink) = self.machine_st.value_to_str_like(address_sink) {
             let address_string = address_sink.as_str(); //to_string();
-            let address: Uri = address_string.parse().unwrap();
+            let address: Url = address_string.parse().unwrap();
 
-            let stream = self.runtime.block_on(async {
-                let https = HttpsConnector::new();
-                let client = Client::builder()
-                    .build::<_, hyper::Body>(https);
+	    let client = reqwest::blocking::Client::builder()
+		.build()
+		.unwrap();
 
-                // request
-                let mut req = Request::builder()
-                    .method(method)
-                    .uri(address)
-                    .body(Body::from(bytes))
-                    .unwrap();
-                // request headers
-                *req.headers_mut() = headers;
-                // do it!
-                let resp = client.request(req).await.unwrap();
-                // status code
-                let status = resp.status().as_u16();
-                self.machine_st.unify_fixnum(Fixnum::build_with(status as i64), address_status);
-                // headers
-                let headers: Vec<HeapCellValue> = resp.headers().iter().map(|(header_name, header_value)| {
-                    let h = self.machine_st.heap.len();
+	    // request
+	    let mut req = reqwest::blocking::Request::new(method, address);
 
-                    let header_term = functor!(
-                        self.machine_st.atom_tbl.build_with(header_name.as_str()),
-                        [cell(string_as_cstr_cell!(self.machine_st.atom_tbl.build_with(header_value.to_str().unwrap())))]
-                    );
+	    *req.headers_mut() = headers;
+	    if bytes.len() > 0 {
+		*req.body_mut() = Some(reqwest::blocking::Body::from(bytes));
+	    }
 
-                    self.machine_st.heap.extend(header_term.into_iter());
-                    str_loc_as_cell!(h)
-                }).collect();
+	    // do it!
+	    match client.execute(req) {
+		Ok(resp) => {
+		    // status code
+		    let status = resp.status().as_u16();
+		    self.machine_st.unify_fixnum(Fixnum::build_with(status as i64), address_status);
+		    // headers
+		    let headers: Vec<HeapCellValue> = resp.headers().iter().map(|(header_name, header_value)| {
+			let h = self.machine_st.heap.len();
 
-                let headers_list = iter_to_heap_list(&mut self.machine_st.heap, headers.into_iter());
-                unify!(self.machine_st, heap_loc_as_cell!(headers_list), self.machine_st.registers[6]);
-                // body
-                let buf = hyper::body::aggregate(resp).await.unwrap();
-                let reader = buf.reader();
+			let header_term = functor!(
+			    self.machine_st.atom_tbl.build_with(header_name.as_str()),
+			    [cell(string_as_cstr_cell!(self.machine_st.atom_tbl.build_with(header_value.to_str().unwrap())))]
+			);
 
-                let mut stream = Stream::from_http_stream(
-                    self.machine_st.atom_tbl.build_with(&address_string),
-                    Box::new(reader),
-                    &mut self.machine_st.arena
-                );
-                *stream.options_mut() = StreamOptions::default();
-                if let Some(alias) = stream.options().get_alias() {
-                    self.indices.stream_aliases.insert(alias, stream);
-                }
+			self.machine_st.heap.extend(header_term.into_iter());
+			str_loc_as_cell!(h)
+		    }).collect();
 
-                self.indices.streams.insert(stream);
+		    let headers_list = iter_to_heap_list(&mut self.machine_st.heap, headers.into_iter());
+		    unify!(self.machine_st, heap_loc_as_cell!(headers_list), self.machine_st.registers[6]);
+		    // body
+		    let reader = resp.bytes().unwrap().reader();
 
-                stream_as_cell!(stream)
-            });
+		    let mut stream = Stream::from_http_stream(
+			self.machine_st.atom_tbl.build_with(&address_string),
+			Box::new(reader),
+			&mut self.machine_st.arena
+		    );
+		    *stream.options_mut() = StreamOptions::default();
+		    if let Some(alias) = stream.options().get_alias() {
+			self.indices.stream_aliases.insert(alias, stream);
+		    }
 
-            let stream_addr = self.deref_register(2);
-            self.machine_st.bind(stream_addr.as_var().unwrap(), stream);
+		    self.indices.streams.insert(stream);
 
+		    let stream = stream_as_cell!(stream);
+
+		    let stream_addr = self.deref_register(2);
+		    self.machine_st.bind(stream_addr.as_var().unwrap(), stream);
+		},
+		Err(_) => {
+		    self.machine_st.fail = true;
+		}
+	    }
         } else {
             let err = self.machine_st.domain_error(DomainErrorType::SourceSink, address_sink);
             let stub = functor_stub(atom!("http_open"), 3);
@@ -4167,26 +4317,31 @@ impl Machine {
                 }
 	    };
 
-	    let (tx, rx) = channel(1);
-	    let tx = Arc::new(Mutex::new(tx));
+	    let (tx, rx) = std::sync::mpsc::sync_channel(1024);
 
 	    let _guard = self.runtime.enter();
-	    let server = match Server::try_bind(&addr) {
-		Ok(server) => server,
+	    let listener = match self.runtime.block_on(async { tokio::net::TcpListener::bind(addr).await }) {
+		Ok(listener) => listener,
 		Err(_) => {
 		    return Err(self.machine_st.open_permission_error(address_sink, atom!("http_listen"), 2));
 		}
 	    };
 
 	    self.runtime.spawn(async move {
-		let make_svc = make_service_fn(move |_conn| {
+		loop {
 		    let tx = tx.clone();
-		    async move { Ok::<_, Infallible>(service_fn(move |req| http::serve_req(req, tx.clone()))) }
-		});
-		let server = server.serve(make_svc);
+		    let (stream, _) = listener.accept().await.unwrap();
 
-		if let Err(_) = server.await {
-		    eprintln!("server error");
+		    tokio::task::spawn(async move {
+			if let Err(err) = http1::Builder::new()
+			    .serve_connection(stream, HttpService {
+				tx
+			    })
+			    .await
+			{
+			    eprintln!("Error serving connection: {:?}", err);
+			}
+		    });
 		}
 	    });
 	    let http_listener = HttpListener { incoming: rx };
@@ -4209,8 +4364,8 @@ impl Machine {
 	    (HeapCellValueTag::Cons, cons_ptr) => {
 		match_untyped_arena_ptr!(cons_ptr,
 		    (ArenaHeaderTag::HttpListener, http_listener) => {
-		        match http_listener.incoming.blocking_recv() {
-			    Some(request) => {
+		        match http_listener.incoming.recv() {
+			    Ok(request) => {
 			        let method_atom = match *request.request.method() {
 				    Method::GET => atom!("get"),
 				    Method::POST => atom!("post"),
@@ -4239,9 +4394,9 @@ impl Machine {
 				let query_str = request.request.uri().query().unwrap_or("");
 				let query_atom = self.machine_st.atom_tbl.build_with(query_str);
 				let query_cell = string_as_cstr_cell!(query_atom);
-				
+
 				let hyper_req = request.request;
-				let buf = self.runtime.block_on(async {hyper::body::aggregate(hyper_req).await.unwrap()});
+				let buf = self.runtime.block_on(async {hyper_req.collect().await.unwrap().aggregate()});
 				let reader = buf.reader();
 
 				let mut stream = Stream::from_http_stream(
@@ -4263,7 +4418,7 @@ impl Machine {
 				self.machine_st.bind(stream_addr.as_var().unwrap(), stream);
 				self.machine_st.bind(handle_addr.as_var().unwrap(), typed_arena_ptr_as_cell!(handle));
 				}
-			    None => {
+			    Err(_) => {
 			        self.machine_st.fail = true;
 			    }
 			}
@@ -4321,15 +4476,10 @@ impl Machine {
 	    (HeapCellValueTag::Cons, cons_ptr) => {
 		match_untyped_arena_ptr!(cons_ptr,
 		    (ArenaHeaderTag::HttpResponse, http_response) => {
-			let mut response = Response::builder()
-			    .status(status_code);
-			*response.headers_mut().unwrap() = headers;
-			let (sender, body) = Body::channel();
-			let response = response.body(body).unwrap();
-			http_response.blocking_send(response).unwrap();
-
 			let mut stream = Stream::from_http_sender(
-			    sender,
+			    http_response,
+			    status_code,
+			    headers,
 			    &mut self.machine_st.arena
 			);
 			*stream.options_mut() = StreamOptions::default();
@@ -4434,7 +4584,7 @@ impl Machine {
 		    }
 		}
 	    }
-	  
+
 	    match self.machine_st.try_from_list(args_reg, stub_gen) {
 		Ok(args) => {
 		    let args: Vec<_> = args.into_iter().map(|x| map_arg(&mut self.machine_st, x)).collect();
@@ -4483,7 +4633,7 @@ impl Machine {
 		    Value::Struct(name, struct_args) => self.build_struct(&name, struct_args),
 		}
 	    }).collect();
-		
+
 	heap_loc_as_cell!(
 	    iter_to_heap_list(
 		&mut self.machine_st.heap,
@@ -4941,9 +5091,7 @@ impl Machine {
 
         let p_functor = self.deref_register(2);
 
-        let p = to_local_code_ptr(&self.machine_st.heap, p_functor).unwrap();
-
-        let num_cells = *self.code[p].perm_vars_mut().unwrap();
+        let num_cells = self.machine_st.stack.index_and_frame(e).prelude.num_cells;
         let mut addrs = vec![];
 
         for idx in 1..num_cells + 1 {
@@ -5045,21 +5193,35 @@ impl Machine {
     }
 
     #[inline(always)]
+    pub(crate) fn get_unknown(&mut self) {
+        let a1 = self.deref_register(1);
+
+        self.machine_st.unify_atom(
+            match self.machine_st.flags.unknown {
+                Unknown::Error => atom!("error"),
+                Unknown::Fail => atom!("fail"),
+                Unknown::Warn => atom!("warning"),
+            },
+            a1,
+        );
+    }
+
+    #[inline(always)]
     pub(crate) fn get_scc_cleaner(&mut self) {
         let dest = self.machine_st.registers[1];
 
-        if let Some((addr, b_cutoff, prev_b)) = self.machine_st.cont_pts.pop() {
+        if let Some((addr, b_cutoff, prev_block)) = self.machine_st.cont_pts.pop() {
             let b = self.machine_st.stack.index_or_frame(self.machine_st.b).prelude.b;
 
             if b <= b_cutoff {
-                self.machine_st.block = prev_b;
+                self.machine_st.scc_block = prev_block;
 
                 if let Some(r) = dest.as_var() {
                     self.machine_st.bind(r, addr);
                     return;
                 }
             } else {
-                self.machine_st.cont_pts.push((addr, b_cutoff, prev_b));
+                self.machine_st.cont_pts.push((addr, b_cutoff, prev_block));
             }
         }
 
@@ -5091,11 +5253,11 @@ impl Machine {
     pub(crate) fn install_scc_cleaner(&mut self) {
         let addr = self.machine_st.registers[1];
         let b = self.machine_st.b;
-        let prev_block = self.machine_st.block;
+        let prev_block = self.machine_st.scc_block;
 
         self.machine_st.run_cleaners_fn = Machine::run_cleaners;
 
-        self.machine_st.install_new_block(self.machine_st.registers[2]);
+        self.machine_st.scc_block = b;
         self.machine_st.cont_pts.push((addr, b, prev_block));
     }
 
@@ -5120,13 +5282,17 @@ impl Machine {
         };
 
         let bp = cell_as_fixnum!(a1).get_num() as usize;
+        let a3 = self.deref_register(3);
         let count = self.machine_st.cwil.add_limit(n, bp);
-        let count = arena_alloc!(count.clone(), &mut self.machine_st.arena);
+
+        if let Some(count) = count.to_i64() {
+            self.machine_st.unify_fixnum(Fixnum::build_with(count), a3);
+        } else {
+            let count = arena_alloc!(count.clone(), &mut self.machine_st.arena);
+            self.machine_st.unify_big_int(count, a3);
+        }
 
         self.machine_st.increment_call_count_fn = MachineState::increment_call_count;
-
-        let a3 = self.deref_register(3);
-        self.machine_st.unify_big_int(count, a3);
 
         Ok(())
     }
@@ -5267,14 +5433,18 @@ impl Machine {
     #[inline(always)]
     pub(crate) fn remove_inference_counter(&mut self) {
         let a1 = self.deref_register(1);
+        let a2 = self.deref_register(2);
+
         let bp = cell_as_fixnum!(a1).get_num() as usize;
 
         let count = self.machine_st.cwil.remove_limit(bp).clone();
-        let count = arena_alloc!(count.clone(), &mut self.machine_st.arena);
 
-        let a2 = self.deref_register(2);
-
-        self.machine_st.unify_big_int(count, a2);
+        if let Some(count) = count.to_i64() {
+            self.machine_st.unify_fixnum(Fixnum::build_with(count), a2);
+        } else {
+            let count = arena_alloc!(count.clone(), &mut self.machine_st.arena);
+            self.machine_st.unify_big_int(count, a2);
+        }
     }
 
     #[inline(always)]
@@ -5378,12 +5548,27 @@ impl Machine {
 
     #[inline(always)]
     pub(crate) fn set_double_quotes(&mut self) {
-        let atom = cell_as_atom!(self.machine_st.registers[1]);
+        let atom = cell_as_atom!(self.deref_register(1));
 
         self.machine_st.flags.double_quotes = match atom {
             atom!("atom") => DoubleQuotes::Atom,
             atom!("chars") => DoubleQuotes::Chars,
             atom!("codes") => DoubleQuotes::Codes,
+            _ => {
+                self.machine_st.fail = true;
+                return;
+            }
+        };
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_unknown(&mut self) {
+        let atom = cell_as_atom!(self.deref_register(1));
+
+        self.machine_st.flags.unknown = match atom {
+            atom!("error") => Unknown::Error,
+            atom!("fail") => Unknown::Fail,
+            atom!("warning") => Unknown::Warn,
             _ => {
                 self.machine_st.fail = true;
                 return;
@@ -5462,19 +5647,29 @@ impl Machine {
 
     #[inline(always)]
     pub(crate) fn get_current_block(&mut self) {
-        let n = Fixnum::build_with(i64::try_from(self.machine_st.block).unwrap());
-        self.machine_st.unify_fixnum(n, self.machine_st.registers[1]);
+        let addr = self.machine_st.registers[1];
+        let block = Fixnum::build_with(self.machine_st.block as i64);
+
+        self.machine_st.unify_fixnum(block, addr);
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_current_scc_block(&mut self) {
+        let addr = self.machine_st.registers[1];
+        let block = Fixnum::build_with(self.machine_st.scc_block as i64);
+
+        self.machine_st.unify_fixnum(block, addr);
     }
 
     #[inline(always)]
     pub(crate) fn get_b_value(&mut self) {
-        let n = Fixnum::build_with(i64::try_from(self.machine_st.b).unwrap());
+        let n = Fixnum::as_cutpoint(i64::try_from(self.machine_st.b).unwrap());
         self.machine_st.unify_fixnum(n, self.machine_st.registers[1]);
     }
 
     #[inline(always)]
     pub(crate) fn get_cut_point(&mut self) {
-        let n = Fixnum::build_with(i64::try_from(self.machine_st.b0).unwrap());
+        let n = Fixnum::as_cutpoint(i64::try_from(self.machine_st.b0).unwrap());
         self.machine_st.unify_fixnum(n, self.machine_st.registers[1]);
     }
 
@@ -5627,50 +5822,114 @@ impl Machine {
             3,
         )?;
 
-        self.machine_st.read_term(stream, &mut self.indices)
+        if let Stream::Readline(..) = stream {
+            self.machine_st.read_term(stream, &mut self.indices, MachineState::read_term_from_user_input_eof_handler)
+        } else {
+            self.machine_st.read_term(stream, &mut self.indices, MachineState::read_term_eof_handler)
+        }
+    }
+
+    #[inline(always)]
+    fn read_term_and_write_to_heap(
+        &mut self,
+        atom_or_string: AtomOrString,
+    ) -> Result<Option<TermWriteResult>, MachineStub> {
+        let string = match atom_or_string {
+            AtomOrString::Atom(atom) if atom == atom!("[]") => "".to_owned(),
+            _ => atom_or_string.to_string(),
+        };
+
+        let chars = CharReader::new(ByteStream::from_string(string));
+        let mut parser = Parser::new(chars, &mut self.machine_st);
+        let op_dir = CompositeOpDir::new(&self.indices.op_dir, None);
+
+        let term_write_result = parser.read_term(&op_dir, Tokens::Default)
+            .map_err(|err| error_after_read_term(err, 0, &parser))
+            .and_then(|term| {
+                write_term_to_heap(
+                    &term,
+                    &mut self.machine_st.heap,
+                    &mut self.machine_st.atom_tbl,
+                )
+            });
+
+        match term_write_result {
+            Ok(term_write_result) => Ok(Some(term_write_result)),
+            Err(CompilationError::ParserError(e)) if e.is_unexpected_eof() => {
+                let value = self.machine_st.registers[2];
+                self.machine_st.unify_atom(atom!("end_of_file"), value);
+
+                Ok(None)
+            }
+            Err(e) => {
+                let stub = functor_stub(atom!("read_term_from_chars"), 3);
+                let e = self.machine_st.session_error(SessionError::from(e));
+
+                Err(self.machine_st.error_form(e, stub))
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_from_chars(&mut self) -> CallResult {
+        if let Some(atom_or_string) = self.machine_st.value_to_str_like(self.machine_st.registers[1]) {
+            if let Some(term_write_result) = self.read_term_and_write_to_heap(atom_or_string)? {
+                let result = heap_loc_as_cell!(term_write_result.heap_loc);
+                let var = self.deref_register(2).as_var().unwrap();
+
+                self.machine_st.bind(var, result);
+            }
+
+            Ok(())
+        } else {
+            unreachable!()
+        }
     }
 
     #[inline(always)]
     pub(crate) fn read_term_from_chars(&mut self) -> CallResult {
         if let Some(atom_or_string) = self.machine_st.value_to_str_like(self.machine_st.registers[1]) {
-            let chars = CharReader::new(ByteStream::from_string(atom_or_string.to_string()));
-            let mut parser = Parser::new(chars, &mut self.machine_st);
-
-            let term_write_result = parser.read_term(&CompositeOpDir::new(&self.indices.op_dir, None))
-                .map_err(CompilationError::from)
-                .and_then(|term| {
-                    write_term_to_heap(
-                        &term,
-                        &mut self.machine_st.heap,
-                        &mut self.machine_st.atom_tbl,
-                    )
-                });
-
-            let term_write_result = match term_write_result {
-                Ok(term_write_result) => term_write_result,
-                Err(e) => {
-                    let stub = functor_stub(atom!("read_term_from_chars"), 2);
-                    let e = self.machine_st.session_error(SessionError::from(e));
-
-                    return Err(self.machine_st.error_form(e, stub));
+            if let Some(term_write_result) = self.read_term_and_write_to_heap(atom_or_string)? {
+                self.machine_st.read_term_body(term_write_result)
+            } else {
+                if !self.machine_st.fail {
+                    // wrote end_of_file term in this case.
+                    self.machine_st.write_read_term_options(vec![], vec![])?;
                 }
-            };
 
-            let result = heap_loc_as_cell!(term_write_result.heap_loc);
-            let var = self.deref_register(2).as_var().unwrap();
-
-            self.machine_st.bind(var, result);
+                Ok(())
+            }
         } else {
             unreachable!()
         }
-
-        Ok(())
     }
 
     #[inline(always)]
     pub(crate) fn reset_block(&mut self) {
-        let addr = self.machine_st.deref(self.machine_st.registers[1]);
-        self.machine_st.reset_block(addr);
+        let addr = self.deref_register(1);
+
+        read_heap_cell!(addr,
+            (HeapCellValueTag::Fixnum, block) => {
+                self.machine_st.block = block.get_num() as usize;
+            }
+            _ => {
+                self.machine_st.fail = true;
+            }
+        );
+    }
+
+    #[inline(always)]
+    pub(crate) fn reset_scc_block(&mut self) {
+        let addr = self.deref_register(1);
+
+        read_heap_cell!(addr,
+            (HeapCellValueTag::Fixnum, block) => {
+                self.machine_st.scc_block = block.get_num() as usize;
+            }
+            _ => {
+                self.machine_st.fail = true;
+            }
+        );
     }
 
     #[inline(always)]
@@ -7270,18 +7529,28 @@ impl Machine {
 
     #[inline(always)]
     pub(crate) fn devour_whitespace(&mut self) -> CallResult {
-        let stream = self.machine_st.get_stream_or_alias(
+        let mut stream = self.machine_st.get_stream_or_alias(
             self.machine_st.registers[1],
             &self.indices.stream_aliases,
             atom!("$devour_whitespace"),
             1,
         )?;
 
-        match self.machine_st.devour_whitespace(stream) {
+        let mut parser = Parser::new(stream, &mut self.machine_st);
+
+        match devour_whitespace(&mut parser) {
             Ok(false) => { // not at EOF.
+                stream.add_lines_read(parser.lines_read());
             }
-            _ => {
+            Ok(true) => {
+                stream.add_lines_read(parser.lines_read());
                 self.machine_st.fail = true;
+            }
+            Err(err) => {
+                let stub = functor_stub(atom!("load"), 1);
+                let err = self.machine_st.syntax_error(err);
+
+                return Err(self.machine_st.error_form(err, stub));
             }
         }
 

@@ -46,6 +46,7 @@ impl MachineState {
             tr: 0,
             hb: 0,
             block: 0,
+            scc_block: 0,
             ball: Ball::new(),
             ball_stack: vec![],
             lifted_heap: Heap::new(),
@@ -327,6 +328,11 @@ impl MachineState {
         unifier.unify_internal();
     }
 
+    #[inline(always)]
+    pub(super) fn effective_block(&self) -> usize {
+        std::cmp::max(self.block, self.scc_block)
+    }
+
     pub(super) fn set_ball(&mut self) {
         self.ball.reset();
 
@@ -340,8 +346,9 @@ impl MachineState {
         );
     }
 
+    #[inline(always)]
     pub(super) fn unwind_stack(&mut self) {
-        self.b = self.block;
+        self.b = self.effective_block();
         self.fail = true;
     }
 
@@ -428,7 +435,7 @@ impl MachineState {
         }
     }
 
-    pub fn compare_term_test(&mut self) -> Option<Ordering> {
+    pub fn compare_term_test(&mut self, var_comparison: VarComparison) -> Option<Ordering> {
         let mut tabu_list = IndexSet::new();
 
         while !self.pdl.is_empty() {
@@ -455,12 +462,14 @@ impl MachineState {
 
             match order_cat_v1 {
                 Some(TermOrderCategory::Variable) => {
-                    let v1 = v1.as_var().unwrap();
-                    let v2 = v2.as_var().unwrap();
+                    if let VarComparison::Distinct = var_comparison {
+                        let v1 = v1.as_var().unwrap();
+                        let v2 = v2.as_var().unwrap();
 
-                    if v1 != v2 {
-                        self.pdl.clear();
-                        return Some(v1.cmp(&v2));
+                        if v1 != v2 {
+                            self.pdl.clear();
+                            return Some(v1.cmp(&v2));
+                        }
                     }
                 }
                 Some(TermOrderCategory::FloatingPoint) => {
@@ -1295,17 +1304,6 @@ impl MachineState {
             .unwrap_or(true)
     }
 
-    pub fn reset_block(&mut self, addr: HeapCellValue) {
-        read_heap_cell!(self.store(addr),
-            (HeapCellValueTag::Fixnum, n) => {
-                self.block = n.get_num() as usize;
-            }
-            _ => {
-                self.fail = true;
-            }
-        )
-    }
-
     #[inline(always)]
     fn try_functor_compound_case(&mut self, name: Atom, arity: usize) {
         self.try_functor_unify_components(atom_as_cell!(name), arity);
@@ -1616,6 +1614,8 @@ impl MachineState {
 
     // returns true on failure.
     pub fn ground_test(&mut self) -> bool {
+        use fxhash::FxBuildHasher;
+
         if self.registers[1].is_constant() {
             return false;
         }
@@ -1626,13 +1626,15 @@ impl MachineState {
             return true;
         }
 
+        let mut visited = IndexSet::with_hasher(FxBuildHasher::default());
         let mut iter = stackful_preorder_iter(&mut self.heap, &mut self.stack, value);
+        let mut stack_len = 0;
 
         while let Some(value) = iter.next() {
-            let value = unmark_cell_bits!(value);
+            let mut value = unmark_cell_bits!(value);
 
             if value.is_var() {
-                let value = heap_bound_store(
+                value = heap_bound_store(
                     iter.heap,
                     heap_bound_deref(iter.heap, value),
                 );
@@ -1641,6 +1643,18 @@ impl MachineState {
                     return true;
                 }
             }
+
+            if value.is_compound(iter.heap) {
+                if visited.contains(&value) {
+                    for _ in stack_len .. iter.stack_len() {
+                        iter.pop_stack();
+                    }
+                } else {
+                    visited.insert(value);
+                }
+            }
+
+            stack_len = iter.stack_len();
         }
 
         false

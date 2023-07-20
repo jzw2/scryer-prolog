@@ -15,9 +15,10 @@ but they're not part of the ISO Prolog standard at the moment.
                     partial_string_tail/2,
                     setup_call_cleanup/3,
                     call_nth/2,
+                    countall/2,
                     copy_term_nat/2,
-		    asserta/2,
-		    assertz/2]).
+                    asserta/2,
+                    assertz/2]).
 
 :- use_module(library(error), [can_be/2,
                                domain_error/3,
@@ -138,7 +139,7 @@ setup_call_cleanup(S, G, C) :-
     '$get_b_value'(B),
     '$call_with_inference_counting'(call(S)),
     '$set_cp_by_default'(B),
-    '$get_current_block'(Bb),
+    '$get_current_scc_block'(Bb),
     (  C = _:CC,
        var(CC) ->
        instantiation_error(setup_call_cleanup/3)
@@ -151,17 +152,16 @@ setup_call_cleanup(S, G, C) :-
 
 scc_helper(C, G, Bb) :-
     '$get_cp'(Cp),
-    '$install_scc_cleaner'(C, NBb),
+    '$install_scc_cleaner'(C),
     '$call_with_inference_counting'(call(G)),
     (  '$check_cp'(Cp) ->
-       '$reset_block'(Bb),
+       '$reset_scc_block'(Bb),
        run_cleaners_without_handling(Cp)
     ;  true
-    ;  '$reset_block'(NBb),
-       '$fail'
+    ;  '$fail'
     ).
 scc_helper(_, _, Bb) :-
-    '$reset_block'(Bb),
+    '$reset_scc_block'(Bb),
     '$push_ball_stack',
     run_cleaners_with_handling,
     '$pop_from_ball_stack',
@@ -175,7 +175,7 @@ scc_helper(_, _, _) :-
 
 run_cleaners_with_handling :-
     '$get_scc_cleaner'(C),
-    '$get_level'(B),
+    '$get_cp'(B),
     catch(C, _, true),
     '$set_cp_by_default'(B),
     run_cleaners_with_handling.
@@ -186,7 +186,7 @@ run_cleaners_with_handling :-
 
 run_cleaners_without_handling(Cp) :-
     '$get_scc_cleaner'(C),
-    '$get_level'(B),
+    '$get_cp'(B),
     call(C),
     '$set_cp_by_default'(B),
     run_cleaners_without_handling(Cp).
@@ -258,7 +258,7 @@ call_with_inference_limit(_, _, R, Bb, B) :-
     '$remove_inference_counter'(B, _),
     (  '$get_ball'(Ball),
        '$push_ball_stack',
-       '$get_level'(Cp),
+       '$get_cp'(Cp),
        '$set_cp_by_default'(Cp)
     ;  '$remove_call_policy_check'(B),
        '$fail'
@@ -340,6 +340,36 @@ call_nth_nesting(C, ID) :-
     bb_put(ID, 0),
     bb_put(i_call_nth_counter, C).
 
+%% countall(Goal, N).
+%
+% countall(Goal, N) counts all solutions of Goal and unifies N with
+% this number of solutions. This predicate always succeeds once.
+
+:- meta_predicate(countall(0, ?)).
+
+countall(Goal, N) :-
+    can_be(integer, N),
+    (   integer(N) ->
+        (   N < 0 ->
+            domain_error(not_less_than_zero, N, countall/2)
+        ;   N > 0
+        )
+    ;   true
+    ),
+    setup_call_cleanup(call_nth_nesting(C, ID),
+                       (   (   Goal,
+                               bb_get(ID, N0),
+                               N1 is N0 + 1,
+                               bb_put(ID, N1),
+                               false
+                           ;   bb_get(ID, N)
+                           )
+                       ),
+                       (   bb_get(i_call_nth_counter, C) ->
+                           C1 is C - 1,
+                           bb_put(i_call_nth_counter, C1)
+                       ;   true
+                       )).
 
 %% copy_term_nat(Source, Dest)
 %

@@ -24,10 +24,14 @@ write_error(Error) :-
     ;  write('   ') % if '$first_answer' isn't defined yet or true,
                     % print indentation.
     ),
+    (  current_prolog_flag(double_quotes, chars) ->
+       DQ = true
+    ;  DQ = false
+    ),
     (  nonvar(Error),
        functor(Error, error, 2) ->
-       writeq(Error)
-    ;  writeq(throw(Error))
+       write_term(Error, [ignore_ops(false), numbervars(true), quoted(true), double_quotes(DQ)])
+    ;  write_term(throw(Error), [ignore_ops(false), numbervars(true), quoted(true), double_quotes(DQ)])
     ),
     write('.').
 
@@ -541,6 +545,7 @@ open_file(Path, Stream) :-
             )
     ).
 
+
 use_module(Module, Exports, Evacuable) :-
     (  var(Module) ->
        instantiation_error(load/1)
@@ -562,10 +567,9 @@ use_module(Module, Exports, Evacuable) :-
           stream_property(Stream, file_name(PathFileName)),
           file_load(Stream, PathFileName, Subevacuable),
           '$use_module'(Evacuable, Subevacuable, Exports)
-       ;  type_error(atom, Library, load/1)
+       ;  type_error(atom, Module, load/1)
        )
     ).
-
 
 
 check_predicate_property(meta_predicate, Module, Name, Arity, MetaPredicateTerm) :-

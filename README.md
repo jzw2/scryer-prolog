@@ -6,6 +6,8 @@ source industrial strength production environment that is also a
 testbed for bleeding edge research in logic and constraint
 programming, which is itself written in a high-level language.
 
+As of July 2023, **Scryer Prolog passes all [syntactic conformity&nbsp;tests](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/conformity_testing)**.
+
 The homepage of the project is: [**https://www.scryer.pl**](https://www.scryer.pl)
 
 ![Scryer Logo: Cryer](logo/scryer.png)
@@ -67,7 +69,7 @@ Extend Scryer Prolog to include the following, among other features:
   - [ ] Replacing choice points pivoting on inlined semi-deterministic predicates
         (`atom`, `var`, etc) with if/else ladders. (_in progress_)
   - [ ] Inlining all built-ins and system call instructions.
-  - [ ] Greatly reducing the number of instructions used to compile disjunctives.
+  - [x] Greatly reducing the number of instructions used to compile disjunctives.
   - [ ] Storing short atoms to heap cells without writing them to the atom table.
 - [ ] A compacting garbage collector satisfying the five properties of
       "[Precise Garbage Collection in Prolog](https://www.complang.tuwien.ac.at/ulrich/papers/PDF/2008-ciclops.pdf)." (_in progress_)
@@ -677,6 +679,26 @@ It stays close to the actual Prolog code under consideration, it does
 not need additional tools and formalisms for its application, and
 further, it encourages declarative reasoning that can in principle
 also be performed automatically.
+
+## Applications
+
+Scryer Prolog's strong commitment to the Prolog ISO standard makes it
+ideally suited for use in corporations and government&nbsp;agencies
+that are subject to strict regulations pertaining to interoperability,
+standards&nbsp;compliance and warranty.
+
+Successful existing applications of Scryer Prolog include the
+[DocLog](https://github.com/aarroyoc/doclog)&nbsp;system which
+generates Scryer's own documentation and homepage, [Symbolic
+Analysis of Grants](https://www.brz.gv.at/en/BRZ-Tech-Blog/Tech-Blog-7-Symbolic-Analysis-of-Grants.html)
+by the Austrian Federal Computing Center, and parts of the
+[precautionary](https://github.com/dcnorris/precautionary/tree/main/exec/prolog)
+package for the analysis of dose-escalation trials in the
+safety-critical and highly regulated domain of clinical&nbsp;oncology.
+
+Scryer Prolog is also very well suited for teaching and learning
+Prolog, and for testing syntactic conformance and hence portability of
+existing Prolog&nbsp;programs.
 
 ## Support and discussions
 

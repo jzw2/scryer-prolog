@@ -83,7 +83,7 @@ print_help :-
 
 print_version :-
     '$scryer_prolog_version'(Version),
-    write(Version), nl,
+    maplist(put_char, Version), nl,
     halt.
 
 gather_goal(Type, Args0, Goals) :-
@@ -115,18 +115,27 @@ layout_and_dot([C|Cs]) :-
     layout_and_dot(Cs).
 
 run_goals([]).
-run_goals([g(Gs0)|Goals]) :-
+run_goals([g(Gs0)|Goals]) :- !,
     (   ends_with_dot(Gs0) -> Gs1 = Gs0
     ;   append(Gs0, ".", Gs1)
     ),
-    read_from_chars(Gs1, Goal),
-    (   catch(
-            user:Goal,
-            Exception,
-            (write(Goal), write(' causes: '), write(Exception), nl) % halt?
-        )
-    ;   write('Warning: initialization failed for '),
-        write(Gs0), nl
+    double_quotes_option(DQ),
+    catch(read_term_from_chars(Gs1, Goal, [variable_names(VNs)]),
+          E,
+          (   write_term(Gs0, [double_quotes(DQ)]),
+              write(' cannot be read: '), write(E), nl,
+              halt
+          )
+    ),
+    (   catch(user:Goal,
+              Exception,
+              (   write_term(Goal, [variable_names(VNs),double_quotes(DQ)]),
+                  write(' causes: '),
+                  write_term(Exception, [double_quotes(DQ)]), nl % halt?
+              )
+        ) -> true
+    ;   write('Warning: initialization failed for: '),
+        write_term(Goal, [variable_names(VNs),double_quotes(DQ)]), nl
     ),
     run_goals(Goals).
 run_goals([Goal|_]) :-
@@ -205,22 +214,29 @@ submit_query_and_print_results(Term, VarList) :-
 
 
 needs_bracketing(Value, Op) :-
-    catch((functor(Value, F, _),
-           current_op(EqPrec, EqSpec, Op),
-           current_op(FPrec, _, F)),
-          _,
-          false),
-    (  EqPrec < FPrec ->
-       true
-    ;  FPrec > 0, F == Value, graphic_token_char(F) ->
-       true
-    ;  F \== '.', '$quoted_token'(F) ->
-       true
-    ;  EqPrec == FPrec,
-       memberchk(EqSpec, [fx,xfx,yfx])
+    nonvar(Value),
+    functor(Value, F, Arity),
+    atom(F),
+    current_op(FPrec, FSpec, F),
+    current_op(EqPrec, EqSpec, Op),
+    arity_specifier(Arity, FSpec),
+    (  Arity =:= 0
+    ;  EqPrec < FPrec
+    ;  EqPrec =:= FPrec,
+       member(EqSpec, [fx,xfx,yfx])
+    ).
+
+arity_specifier(0, _).
+arity_specifier(1, S) :- atom_chars(S, [_,_]).
+arity_specifier(2, S) :- atom_chars(S, [_,_,_]).
+
+double_quotes_option(DQ) :-
+    (   current_prolog_flag(double_quotes, chars) -> DQ = true
+    ;   DQ = false
     ).
 
 write_goal(G, VarList, MaxDepth) :-
+    double_quotes_option(DQ),
     (  G = (Var = Value) ->
        (  var(Value) ->
           select((Var = _), VarList, NewVarList)
@@ -228,18 +244,19 @@ write_goal(G, VarList, MaxDepth) :-
        ),
        write(Var),
        write(' = '),
-       (  needs_bracketing(Value, (=)) ->
+       (  needs_bracketing(Value, =) ->
           write('('),
-          write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth)]),
+          write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth), double_quotes(DQ)]),
           write(')')
-       ;  write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth)])
+       ;  write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth), double_quotes(DQ)])
        )
     ;  G == [] ->
        write('true')
-    ;  write_term(G, [quoted(true), variable_names(VarList), max_depth(MaxDepth)])
+    ;  write_term(G, [quoted(true), variable_names(VarList), max_depth(MaxDepth), double_quotes(DQ)])
     ).
 
 write_last_goal(G, VarList, MaxDepth) :-
+    double_quotes_option(DQ),
     (  G = (Var = Value) ->
        (  var(Value) ->
           select((Var = _), VarList, NewVarList)
@@ -247,11 +264,11 @@ write_last_goal(G, VarList, MaxDepth) :-
        ),
        write(Var),
        write(' = '),
-       (  needs_bracketing(Value, (=)) ->
+       (  needs_bracketing(Value, =) ->
           write('('),
-          write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth)]),
+          write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth), double_quotes(DQ)]),
           write(')')
-       ;  write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth)]),
+       ;  write_term(Value, [quoted(true), variable_names(NewVarList), max_depth(MaxDepth), double_quotes(DQ)]),
           (  trailing_period_is_ambiguous(Value) ->
              write(' ')
           ;  true
@@ -259,7 +276,7 @@ write_last_goal(G, VarList, MaxDepth) :-
        )
     ;  G == [] ->
        write('true')
-    ;  write_term(G, [quoted(true), variable_names(VarList), max_depth(MaxDepth)])
+    ;  write_term(G, [quoted(true), variable_names(VarList), max_depth(MaxDepth), double_quotes(DQ)])
     ).
 
 write_eq((G1, G2), VarList, MaxDepth) :-
@@ -271,8 +288,7 @@ write_eq(G, VarList, MaxDepth) :-
     write_last_goal(G, VarList, MaxDepth).
 
 graphic_token_char(C) :-
-    memberchk(C, ['#', '$', '&', '*', '+', '-', '.', ('/'), ':',
-                  '<', '=', '>', '?', '@', '^', '~', ('\\')]).
+    memberchk(C, [#, $, &, *, +, -, ., /, :, <, =, >, ?, @, ^, ~, \]).
 
 list_last_item([C], C) :- !.
 list_last_item([_|Cs], D) :-

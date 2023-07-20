@@ -2,8 +2,8 @@ use crate::parser::ast::*;
 
 use crate::arena::*;
 use crate::atom_table::*;
-use crate::fixtures::*;
 use crate::forms::*;
+use crate::machine::ClauseType;
 use crate::machine::loader::*;
 use crate::machine::machine_state::*;
 use crate::machine::streams::Stream;
@@ -16,7 +16,6 @@ use modular_bitfield::specifiers::*;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 
 use crate::types::*;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -228,8 +227,32 @@ impl CodeIndex {
     }
 }
 
-pub(crate) type HeapVarDict = IndexMap<Rc<String>, HeapCellValue, FxBuildHasher>;
-pub(crate) type AllocVarDict = IndexMap<Rc<String>, VarData, FxBuildHasher>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VarKey {
+    AnonVar(usize),
+    VarPtr(VarPtr),
+}
+
+impl VarKey {
+    #[inline]
+    pub(crate) fn to_string(&self) -> String {
+        match self {
+            VarKey::AnonVar(h) => format!("_{}", h),
+            VarKey::VarPtr(var) => var.borrow().to_string(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_anon(&self) -> bool {
+        if let VarKey::AnonVar(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub(crate) type HeapVarDict = IndexMap<VarKey, HeapCellValue, FxBuildHasher>;
 
 pub(crate) type GlobalVarDir = IndexMap<Atom, (Ball, Option<HeapCellValue>), FxBuildHasher>;
 
@@ -262,6 +285,18 @@ pub struct IndexStore {
 }
 
 impl IndexStore {
+    pub(crate) fn builtin_property(&self, key: PredicateKey) -> bool {
+        let (name, arity) = key;
+
+        if !ClauseType::is_inbuilt(name, arity) {
+            self.modules.get(&(atom!("builtins")))
+                .map(|module| module.code_dir.contains_key(&(name, arity)))
+                .unwrap_or(false)
+        } else {
+            true
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn goal_expansion_defined(&self, key: PredicateKey) -> bool {
         self.goal_expansion_indices.contains(&key)

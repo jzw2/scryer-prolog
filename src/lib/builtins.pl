@@ -17,13 +17,13 @@
                      peek_char/1, peek_char/2, peek_code/1,
                      peek_code/2, put_byte/1, put_byte/2, put_code/1,
                      put_code/2, put_char/1, put_char/2, read/1,
-                     read_term/2, read_term/3, repeat/0, retract/1,
-                     retractall/1, set_prolog_flag/2, set_input/1,
-                     set_stream_position/2, set_output/1, setof/3,
-                     stream_property/2, sub_atom/5, subsumes_term/2,
-                     term_variables/2, throw/1, true/0,
-                     unify_with_occurs_check/2, write/1, write/2,
-                     write_canonical/1, write_canonical/2,
+                     read/2, read_term/2, read_term/3, repeat/0,
+                     retract/1, retractall/1, set_prolog_flag/2,
+                     set_input/1, set_stream_position/2, set_output/1,
+                     setof/3, stream_property/2, sub_atom/5,
+                     subsumes_term/2, term_variables/2, throw/1,
+                     true/0, unify_with_occurs_check/2, write/1,
+                     write/2, write_canonical/1, write_canonical/2,
                      write_term/2, write_term/3, writeq/1, writeq/2]).
 
 /** Builtin predicates
@@ -140,7 +140,9 @@ call(_, _, _, _, _, _, _, _, _).
 %  * `occurs_check`: Returns if the occurs check is enabled. The occurs check prevents the creation cyclic terms.
 %    Historically the Prolog unification algorithm didn't do that check so changing the value modifies how Prolog
 %    operates in the low-level. Possible values are `false`  (default), `true` (unification has this check
-%    enabled) and `error` which throws an exception when a cylic term is created. Read ans write.
+%    enabled) and `error` which throws an exception when a cylic term is created. Read and write.
+%  * `unknown`: How undefined predicates are handled when called. Possible values are `error` (the default, an error is thrown),
+%    `fail` (the call silently fails) and `warn` (the call fails and a warning about the undefined predicate is printed).
 %
 current_prolog_flag(Flag, Value) :- Flag == max_arity, !, Value = 1023.
 current_prolog_flag(max_arity, 1023).
@@ -150,6 +152,8 @@ current_prolog_flag(Flag, Value) :- Flag == integer_rounding_function, !, Value 
 current_prolog_flag(integer_rounding_function, toward_zero).
 current_prolog_flag(Flag, Value) :- Flag == double_quotes, !, '$get_double_quotes'(Value).
 current_prolog_flag(double_quotes, Value) :- '$get_double_quotes'(Value).
+current_prolog_flag(Flag, Value) :- Flag == unknown, !, '$get_unknown'(Value).
+current_prolog_flag(unknown, Value) :- '$get_unknown'(Value).
 current_prolog_flag(Flag, _) :- Flag == max_integer, !, '$fail'.
 current_prolog_flag(Flag, _) :- Flag == min_integer, !, '$fail'.
 current_prolog_flag(Flag, OccursCheckEnabled) :-
@@ -190,6 +194,12 @@ set_prolog_flag(double_quotes, atom) :-
     !, '$set_double_quotes'(atom). % 7.11.2.5, list of char codes (UTF8).
 set_prolog_flag(double_quotes, codes) :-
     !, '$set_double_quotes'(codes).
+set_prolog_flag(unknown, error) :-
+    !, '$set_unknown'(error).
+set_prolog_flag(unknown, warning) :-
+    !, '$set_unknown'(warning).
+set_prolog_flag(unknown, fail) :-
+    !, '$set_unknown'(fail).
 set_prolog_flag(occurs_check, true) :-
     !, '$set_sto_as_unify'.
 set_prolog_flag(occurs_check, false) :-
@@ -218,13 +228,13 @@ fail :- '$fail'.
 %% \+(Goal)
 %
 % True iff Goal fails
-\+ G :- call(G), !, false.
+\+ G :- call(G), !, '$fail'.
 \+ _.
 
 %% \=(?X, ?Y)
 %
 % True iff X and Y can't be unified
-X \= X :- !, false.
+X \= X :- !, '$fail'.
 _ \= _.
 
 
@@ -301,18 +311,11 @@ set_cp(B) :- '$set_cp'(B).
 
 control_entry_point(G) :-
     functor(G, Name, Arity),
-    catch(builtins:control_entry_point_(G),
-          dispatch_prep_error,
-          builtins:throw(error(type_error(callable, G), Name/Arity))).
-
-
-:- non_counted_backtracking control_entry_point_/1.
-
-control_entry_point_(G) :-
     '$get_cp'(B),
-    dispatch_prep(G,B,Conts),
+    catch('$call'(builtins:dispatch_prep(G,B,Conts)),
+          dispatch_prep_error,
+          '$call'(builtins:throw(error(type_error(callable, G), Name/Arity)))),
     dispatch_call_list(Conts).
-
 
 :- non_counted_backtracking cont_list_to_goal/2.
 
@@ -528,30 +531,34 @@ parse_options_list(Options, Selector, DefaultPairs, OptionValues, Stub) :-
 
 
 parse_write_options(Options, OptionValues, Stub) :-
-    DefaultOptions = [ignore_ops-false, max_depth-0, numbervars-false,
+    DefaultOptions = [double_quotes-false, ignore_ops-false, max_depth-0, numbervars-false,
                       quoted-false, variable_names-[]],
     parse_options_list(Options, builtins:parse_write_options_, DefaultOptions, OptionValues, Stub).
 
+
+parse_write_options_(double_quotes(DoubleQuotes), double_quotes-DoubleQuotes) :-
+    (  nonvar(DoubleQuotes),
+       lists:member(DoubleQuotes, [true, false]),
+       !
+    ;  throw(error(domain_error(write_option, double_quotes(DoubleQuotes)), _))
+    ).
 parse_write_options_(ignore_ops(IgnoreOps), ignore_ops-IgnoreOps) :-
     (  nonvar(IgnoreOps),
        lists:member(IgnoreOps, [true, false]),
        !
-    ;
-       throw(error(domain_error(write_option, ignore_ops(IgnoreOps)), _))
+    ;  throw(error(domain_error(write_option, ignore_ops(IgnoreOps)), _))
     ).
 parse_write_options_(quoted(Quoted), quoted-Quoted) :-
     (  nonvar(Quoted),
        lists:member(Quoted, [true, false]),
        !
-    ;
-       throw(error(domain_error(write_option, quoted(Quoted)), _))
+    ;  throw(error(domain_error(write_option, quoted(Quoted)), _))
     ).
 parse_write_options_(numbervars(NumberVars), numbervars-NumberVars) :-
     (  nonvar(NumberVars),
        lists:member(NumberVars, [true, false]),
        !
-    ;
-       throw(error(domain_error(write_option, numbervars(NumberVars)), _))
+    ;  throw(error(domain_error(write_option, numbervars(NumberVars)), _))
     ).
 parse_write_options_(variable_names(VNNames), variable_names-VNNames) :-
     must_be_var_names_list(VNNames),
@@ -560,8 +567,7 @@ parse_write_options_(max_depth(MaxDepth), max_depth-MaxDepth) :-
     (  integer(MaxDepth),
        MaxDepth >= 0,
        !
-    ;
-       throw(error(domain_error(write_option, max_depth(MaxDepth)), _))
+    ;  throw(error(domain_error(write_option, max_depth(MaxDepth)), _))
     ).
 parse_write_options_(E, _) :-
     throw(error(domain_error(write_option, E), _)).
@@ -607,11 +613,12 @@ write_term(Term, Options) :-
 %  * `max_depth(+N)` if the term is nested deeper than N, print the reminder as ellipses.
 %    If N = 0 (default), there's no limit.
 %  * `numbervars(+Boolean)` if true, replaces `$VAR(N)` variables with letters, in order. Default is false.
-%  * `quoted(+Boolean)` if true, strings and atoms that need quotes to be valid Prolog synytax, are quoted. Default is false.
+%  * `quoted(+Boolean)` if true, strings and atoms that need quotes to be valid Prolog syntax, are quoted. Default is false.
 %  * `variable_names(+List)` assign names to variables in term. List should be a list of terms of format `Name=Var`.
+%  * `double_quotes(+Boolean)` if true, strings are printed in double quotes rather than with list notation. Default is false.
 write_term(Stream, Term, Options) :-
-    parse_write_options(Options, [IgnoreOps, MaxDepth, NumberVars, Quoted, VNNames], write_term/3),
-    '$write_term'(Stream, Term, IgnoreOps, NumberVars, Quoted, VNNames, MaxDepth).
+    parse_write_options(Options, [DoubleQuotes, IgnoreOps, MaxDepth, NumberVars, Quoted, VNNames], write_term/3),
+    '$write_term'(Stream, Term, IgnoreOps, NumberVars, Quoted, VNNames, MaxDepth, DoubleQuotes).
 
 
 %% write(+Term).
@@ -619,26 +626,26 @@ write_term(Stream, Term, Options) :-
 % Write Term to the current output stream using a syntax similar to Prolog
 write(Term) :-
     current_output(Stream),
-    '$write_term'(Stream, Term, false, true, false, [], 0).
+    '$write_term'(Stream, Term, false, true, false, [], 0, false).
 
 %% write(+Stream, +Term).
 %
 % Write Term to the stream Stream using a syntax similar to Prolog
 write(Stream, Term) :-
-    '$write_term'(Stream, Term, false, true, false, [], 0).
+    '$write_term'(Stream, Term, false, true, false, [], 0, false).
 
 %% write_canonical(+Term).
 %
 % Write Term to the current output stream using canonical Prolog syntax. Can be read back as Prolog terms.
 write_canonical(Term) :-
     current_output(Stream),
-    '$write_term'(Stream, Term, true, false, true, [], 0).
+    '$write_term'(Stream, Term, true, false, true, [], 0, false).
 
 %% write_canonical(+Stream, +Term).
 %
 % Write Term to the stream Stream using canonical Prolog syntax. Can be read back as Prolog terms.
 write_canonical(Stream, Term) :-
-    '$write_term'(Stream, Term, true, false, true, [], 0).
+    '$write_term'(Stream, Term, true, false, true, [], 0, false).
 
 %% writeq(+Term).
 %
@@ -646,14 +653,14 @@ write_canonical(Stream, Term) :-
 % quoted according to Prolog syntax.
 writeq(Term) :-
     current_output(Stream),
-    '$write_term'(Stream, Term, false, true, true, [], 0).
+    '$write_term'(Stream, Term, false, true, true, [], 0, false).
 
 %% writeq(+Stream, +Term).
 %
 % Write Term to the stream Stream using a syntax similar to `write/1` but quoting the atoms that need to be
 % quoted according to Prolog syntax.
 writeq(Stream, Term) :-
-    '$write_term'(Stream, Term, false, true, true, [], 0).
+    '$write_term'(Stream, Term, false, true, true, [], 0, false).
 
 select_rightmost_options([Option-Value | OptionPairs], OptionValues) :-
     (  pairs:same_key(Option, OptionPairs, OtherValues, _),
@@ -671,9 +678,30 @@ parse_read_term_options(Options, OptionValues, Stub) :-
     parse_options_list(Options, builtins:parse_read_term_options_, DefaultOptions, OptionValues, Stub).
 
 
-parse_read_term_options_(singletons(Vars), singletons-Vars) :- !.
-parse_read_term_options_(variables(Vars), variables-Vars) :- !.
-parse_read_term_options_(variable_names(Vars), variable_names-Vars) :- !.
+parse_read_term_options_(singletons(Vars), singletons-Vars) :-
+    (  ( var(Vars)
+       ; '$skip_max_list'(_, _, Vars, Rs),
+         Rs == []
+       ) ->
+       !
+    ;  throw(error(domain_error(read_option, singletons(Vars)), read_term/2))
+    ).
+parse_read_term_options_(variables(Vars), variables-Vars) :-
+    (  ( var(Vars)
+       ; '$skip_max_list'(_, _, Vars, Rs),
+         Rs == []
+       ) ->
+       !
+    ;  throw(error(domain_error(read_option, variables(Vars)), read_term/2))
+    ).
+parse_read_term_options_(variable_names(Vars), variable_names-Vars) :-
+    (  ( var(Vars)
+       ; '$skip_max_list'(_, _, Vars, Rs),
+         Rs == []
+       ) ->
+       !
+    ;  throw(error(domain_error(read_option, variable_names(Vars)), read_term/2))
+    ).
 parse_read_term_options_(E,_) :-
     throw(error(domain_error(read_option, E), _)).
 
@@ -701,7 +729,11 @@ read_term(Term, Options) :-
 % to read input from a file or the user. Use other predicates like `phrase_from_file/2` for that.
 read(Term) :-
     current_input(Stream),
-    read(Stream, Term).
+    read_term(Stream, Term, []).
+    % read(Stream, Term).
+
+read(Stream, Term) :-
+    read_term(Stream, Term, []).
 
 % ensures List is either a variable or a list.
 can_be_list(List, _)  :-
@@ -767,7 +799,7 @@ catch(G,C,R,Bb) :-
 end_block(Bb, NBb) :-
     '$clean_up_block'(NBb),
     '$reset_block'(Bb).
-end_block(Bb, NBb) :-
+end_block(_Bb, NBb) :-
     '$reset_block'(NBb),
     '$fail'.
 
@@ -886,12 +918,45 @@ set_difference([X|Xs], [Y|Ys], Zs) :-
 set_difference([], _, []) :- !.
 set_difference(Xs, [], Xs).
 
+
+% variant/2 checks whether X is a variant of Y per the definition in
+% 7.1.6.1 of the ISO standard.
+
+:- non_counted_backtracking variant/4.
+
+variant(X,Y,VPs,VPs0) :-
+    (  var(X) ->
+       var(Y),
+       VPs = [X-Y|VPs0]
+    ;  var(Y) ->
+       false
+    ;  X =.. [FX | XArgs],
+       Y =.. [FX | YArgs],
+       lists:foldl('$call'(builtins:variant), XArgs, YArgs, VPs, VPs0)
+    ).
+
+:- non_counted_backtracking variant/2.
+
+singleton([_]).
+
+variant(X, Y) :-
+    variant(X,Y, VPs, []),
+    keysort(VPs, SVPs),
+    pairs:group_pairs_by_key(SVPs, SVPKs),
+    pairs:pairs_values(SVPKs, Vals),
+    lists:maplist('$call'(builtins:term_variables), Vals, Vs),
+    lists:maplist('$call'(builtins:singleton), Vs),
+    term_variables(Vs, YVars),
+    lists:length(SVPKs, N),
+    lists:length(YVars, N).
+
+
 :- non_counted_backtracking group_by_variant/4.
 
 group_by_variant([V2-S2 | Pairs], V1-S1, [S2 | Solutions], Pairs0) :-
-    V1 = V2, % \+ \+ (V1 = V2), % (2) % iso_ext:variant(V1, V2), % (1)
+    variant(V1, V2),
     !,
-    % V1 = V2, % (3)
+    V1 = V2,
     group_by_variant(Pairs, V2-S2, Solutions, Pairs0).
 group_by_variant(Pairs, _, [], Pairs).
 
@@ -1011,7 +1076,7 @@ setof(Template, Goal, Solution) :-
     term_variables(TemplateVars+GoalVars, TGVs),
     lists:append(TemplateVars, Witnesses0, TGVs),
     findall_with_existential(Template, Goal, PairedSolutions0, Witnesses0, Witnesses),
-    keysort(PairedSolutions0, PairedSolutions),
+    '$keysort_with_constant_var_ordering'(PairedSolutions0, PairedSolutions), % see 7.2.1
     group_by_variants(PairedSolutions, GroupedSolutions),
     iterate_variants_and_sort(GroupedSolutions, Witnesses, Solution).
 
@@ -1252,9 +1317,14 @@ abolish(Pred) :-
 % It can be used to check for existence of a predicate or to enumerate all loaded predicates
 current_predicate(Pred) :-
     (  var(Pred) ->
-       '$get_db_refs'(_, _, PIs),
+       '$get_db_refs'(_, _, _, PIs),
        lists:member(Pred, PIs)
-    ;  Pred = Name/Arity ->
+    ;  '$strip_module'(Pred, Module, UnqualifiedPred),
+       (  var(Module),
+          \+ functor(Pred, (:), 2)
+       ;  atom(Module)
+       ),
+       UnqualifiedPred = Name/Arity ->
        (  (  nonvar(Name), \+ atom(Name)
           ;  nonvar(Arity), \+ integer(Arity)
           ;  integer(Arity), Arity < 0
@@ -1262,9 +1332,9 @@ current_predicate(Pred) :-
           throw(error(type_error(predicate_indicator, Pred), current_predicate/1))
        ;  nonvar(Name),
           nonvar(Arity) ->
-          '$lookup_db_ref'(Name, Arity)
-       ;  '$get_db_refs'(Name, Arity, PIs),
-          lists:member(Pred, PIs)
+          '$lookup_db_ref'(Module, Name, Arity)
+       ;  '$get_db_refs'(Module, Name, Arity, PIs),
+          lists:member(UnqualifiedPred, PIs)
        )
     ;  throw(error(type_error(predicate_indicator, Pred), current_predicate/1))
     ).
@@ -1489,9 +1559,14 @@ atom_concat(Atom_1, Atom_2, Atom_12) :-
        (  var(Atom_12) ->
           throw(error(instantiation_error, atom_concat/3))
        ;  atom_chars(Atom_12, Atom_12_Chars),
-          lists:append(BeforeChars, AfterChars, Atom_12_Chars),
-          atom_chars(Atom_1, BeforeChars),
-          atom_chars(Atom_2, AfterChars)
+          (  var(Atom_2) ->
+             lists:append(BeforeChars, AfterChars, Atom_12_Chars),
+             atom_chars(Atom_2, AfterChars)
+          ;  atom_chars(Atom_2, AfterChars),
+             lists:append(BeforeChars, AfterChars, Atom_12_Chars),
+             !
+          ),
+          atom_chars(Atom_1, BeforeChars)
        )
     ;  var(Atom_2) ->
        (  var(Atom_12) -> throw(error(instantiation_error, atom_concat/3))

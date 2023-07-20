@@ -10,8 +10,9 @@ read and write chars.
                     chars_utf8bytes/2,
                     get_single_char/1,
                     get_n_chars/3,
-                    read_line_to_chars/3,
+                    get_line_to_chars/3,
                     read_from_chars/2,
+                    read_term_from_chars/3,
                     write_term_to_chars/3,
                     chars_base64/3]).
 
@@ -193,7 +194,23 @@ get_single_char(C) :-
 % ```
 read_from_chars(Chars, Term) :-
     must_be(chars, Chars),
-    '$read_term_from_chars'(Chars, Term).
+    must_be(var, Term),
+    '$read_from_chars'(Chars, Term).
+
+%% read_term_from_chars(+Chars, -Term, +Options).
+%
+% Like `read_from_chars`, except the reader is configured according to
+% `Options` which are those of `read_term`.
+%
+% ```
+% ?- read_term_from_chars("f(X,y).", T, [variable_names(['X'=X])]).
+%    T = f(X,y).
+% ```
+read_term_from_chars(Chars, Term, Options) :-
+    must_be(chars, Chars),
+    must_be(var, Term),
+    builtins:parse_read_term_options(Options, [Singletons, VariableNames, Variables], read_term_from_chars/3),
+    '$read_term_from_chars'(Chars, Term, Singletons, Variables, VariableNames).
 
 %% write_term_to_chars(+Term, +Options, -Chars).
 %
@@ -205,13 +222,14 @@ read_from_chars(Chars, Term) :-
 %  * `max_depth(+N)` if the term is nested deeper than N, print the reminder as ellipses.
 %    If N = 0 (default), there's no limit.
 %  * `numbervars(+Boolean)` if true, replaces `$VAR(N)` variables with letters, in order. Default is false.
-%  * `quoted(+Boolean)` if true, strings and atoms that need quotes to be valid Prolog synytax, are quoted. Default is false.
+%  * `quoted(+Boolean)` if true, strings and atoms that need quotes to be valid Prolog syntax, are quoted. Default is false.
 %  * `variable_names(+List)` assign names to variables in term. List should be a list of terms of format `Name=Var`.
+%  * `double_quotes(+Boolean)` if true, strings are printed in double quotes rather than with list notation. Default is false.
 write_term_to_chars(_, Options, _) :-
     var(Options), instantiation_error(write_term_to_chars/3).
 write_term_to_chars(Term, Options, Chars) :-
     builtins:parse_write_options(Options,
-                                 [IgnoreOps, MaxDepth, NumberVars, Quoted, VNNames],
+                                 [DoubleQuotes, IgnoreOps, MaxDepth, NumberVars, Quoted, VNNames],
                                  write_term_to_chars/3),
     (  nonvar(Chars)  ->
        throw(error(uninstantiation_error(Chars), write_term_to_chars/3))
@@ -220,7 +238,7 @@ write_term_to_chars(Term, Options, Chars) :-
     ),
     term_variables(Term, Vars),
     extend_var_list(Vars, VNNames, NewVarNames, numbervars),
-    '$write_term_to_chars'(Chars, Term, IgnoreOps, NumberVars, Quoted, NewVarNames, MaxDepth).
+    '$write_term_to_chars'(Chars, Term, IgnoreOps, NumberVars, Quoted, NewVarNames, MaxDepth, DoubleQuotes).
 
 % Encodes Ch character to list of Bytes.
 char_utf8bytes(Ch, Bytes) :-
@@ -277,17 +295,17 @@ continuation(Code, Chars, Nb) --> [Byte],
 % each remaining continuation byte (if any) will raise 0xFFFD too
 continuation(_, ['\xFFFD\'|T], _) --> [_], decode_utf8(T).
 
-%% read_line_to_chars(+Stream, -Chars, +InitialChars).
+%% get_line_to_chars(+Stream, -Chars, +InitialChars).
 %
 % Reads chars from stream Stream until it finds a `\n` character.
 % InitialChars will be appended at the end of Chars
-read_line_to_chars(Stream, Cs0, Cs) :-
+get_line_to_chars(Stream, Cs0, Cs) :-
         '$get_n_chars'(Stream, 1, Char), % this also works for binary streams
         (   Char == [] -> Cs0 = Cs
         ;   Char = [C],
             Cs0 = [C|Rest],
             (   C == '\n' -> Rest = Cs
-            ;   read_line_to_chars(Stream, Rest, Cs)
+            ;   get_line_to_chars(Stream, Rest, Cs)
             )
         ).
 
@@ -299,17 +317,22 @@ read_line_to_chars(Stream, Cs0, Cs) :-
 get_n_chars(Stream, N, Cs) :-
         can_be(integer, N),
         (   var(N) ->
-            read_to_eof(Stream, Cs),
+            get_to_eof(Stream, Cs),
             length(Cs, N)
         ;   N >= 0,
             '$get_n_chars'(Stream, N, Cs)
         ).
 
-read_to_eof(Stream, Cs) :-
-        '$get_n_chars'(Stream, 512, Cs0),
+get_n_chars_wrapper(Stream, N, Cs) :-
+        '$get_n_chars'(Stream, N, Cs).
+
+get_to_eof(Stream, Cs) :-
+        catch(get_n_chars_wrapper(Stream, 512, Cs0),
+              error(syntax_error(unexpected_end_of_file), _),
+              Cs0 = []),
         (   Cs0 == [] -> Cs = []
         ;   partial_string(Cs0, Cs, Rest),
-            read_to_eof(Stream, Rest)
+            get_to_eof(Stream, Rest)
         ).
 
 %% chars_base64(?Chars, ?Base64, +Options).
