@@ -1,15 +1,157 @@
 #[cfg(test)]
-pub(crate) use crate::machine::gc::{IteratorUMP, StacklessPreOrderHeapIter};
+pub(crate) use crate::machine::gc::StacklessPreOrderHeapIter;
 
 use crate::atom_table::*;
+use crate::machine::cycle_detection::*;
 use crate::machine::heap::*;
 use crate::machine::stack::*;
 use crate::types::*;
 
-use modular_bitfield::prelude::*;
+use core::marker::PhantomData;
+use scryer_modular_bitfield::prelude::*;
 
 use std::ops::Deref;
 use std::vec::Vec;
+
+#[inline(always)]
+pub fn eager_stackful_preorder_iter(
+    heap: &mut Heap,
+    value: HeapCellValue,
+) -> EagerStackfulPreOrderHeapIter {
+    EagerStackfulPreOrderHeapIter::new(heap, value)
+}
+
+/*
+ * Unlike StackfulPreOrderHeapIter, this iterator not only marks
+ * cyclic terms for the sake of skipping them at the second visit but
+ * leaves them marked until it is dropped. This makes for, e.g., more
+ * efficient ground/1 and term_variables/2 definitions.
+ */
+
+pub struct EagerStackfulPreOrderHeapIter<'a> {
+    start_value: HeapCellValue,
+    iter_stack: Vec<HeapCellValue>,
+    mark_phase: bool,
+    heap: &'a mut Heap,
+}
+
+impl<'a> Drop for EagerStackfulPreOrderHeapIter<'a> {
+    fn drop(&mut self) {
+        self.mark_phase = false;
+
+        self.iter_stack.clear();
+        self.start_value.set_mark_bit(true);
+        self.iter_stack.push(self.start_value);
+
+        while self.follow().is_some() {}
+    }
+}
+
+impl<'a> EagerStackfulPreOrderHeapIter<'a> {
+    pub fn new(heap: &'a mut Heap, value: HeapCellValue) -> Self {
+        Self {
+            start_value: value,
+            iter_stack: vec![value],
+            mark_phase: true,
+            heap,
+        }
+    }
+
+    #[inline]
+    fn is_self_ref_var(&self, value: HeapCellValue) -> bool {
+        if value.is_var() {
+            let h = value.get_value() as usize;
+
+            if self.heap[h].is_var() && self.heap[h].get_value() as usize == h {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn follow(&mut self) -> Option<HeapCellValue> {
+        while let Some(value) = self.iter_stack.pop() {
+            if value.get_mark_bit() == self.mark_phase {
+                // follow marked variables to their end. only marked
+                // non-variables are ignored.
+                if self.is_self_ref_var(value) {
+                    return Some(unmark_cell_bits!(value));
+                } else if !value.is_var() {
+                    continue;
+                }
+            }
+
+            read_heap_cell!(value,
+                (HeapCellValueTag::Str, s) => {
+                    let arity = cell_as_atom_cell!(self.heap[s]).get_arity();
+
+                    for idx in (s + 1 .. s + arity + 1).rev() {
+                        if self.heap[idx].get_mark_bit() != self.mark_phase {
+                            self.iter_stack.push(self.heap[idx]);
+                            self.heap[idx].set_mark_bit(self.mark_phase);
+                        }
+                    }
+                }
+                (HeapCellValueTag::Lis, l) => {
+                    if self.heap[l+1].get_mark_bit() != self.mark_phase {
+                        self.iter_stack.push(self.heap[l+1]);
+                        self.heap[l+1].set_mark_bit(self.mark_phase);
+                    }
+
+                    if self.heap[l].get_mark_bit() != self.mark_phase {
+                        self.iter_stack.push(self.heap[l]);
+                        self.heap[l].set_mark_bit(self.mark_phase);
+                    }
+                }
+                (HeapCellValueTag::AttrVar | HeapCellValueTag::Var, h) => {
+                    let var_value = self.heap[h];
+                    self.heap[h].set_mark_bit(self.mark_phase);
+
+                    if var_value.get_mark_bit() || !(self.heap[h].is_var() && self.heap[h].get_value() as usize == h) {
+                        self.iter_stack.push(var_value);
+                        continue;
+                    }
+                }
+                (HeapCellValueTag::PStrLoc, h) => {
+                    let h = if self.heap[h].get_tag() == HeapCellValueTag::PStr {
+                        h
+                    } else {
+                        debug_assert_eq!(self.heap[h].get_tag(), HeapCellValueTag::PStrOffset);
+                        self.heap[h].get_value() as usize
+                    };
+
+                    if self.heap[h].get_mark_bit() == self.mark_phase {
+                        continue;
+                    }
+
+                    self.heap[h].set_mark_bit(self.mark_phase);
+
+                    if self.heap[h].get_tag() == HeapCellValueTag::PStr {
+                        let value = self.heap[h+1];
+                        self.heap[h+1].set_mark_bit(self.mark_phase);
+                        self.iter_stack.push(value);
+                    }
+                }
+                _ => {
+                }
+            );
+
+            return Some(value);
+        }
+
+        None
+    }
+}
+
+impl<'a> Iterator for EagerStackfulPreOrderHeapIter<'a> {
+    type Item = HeapCellValue;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.follow()
+    }
+}
 
 #[derive(BitfieldSpecifier, Clone, Copy, Debug, PartialEq, Eq)]
 #[bits = 2]
@@ -73,25 +215,46 @@ impl IterStackLoc {
     #[inline]
     pub fn as_ref(self) -> Ref {
         match self.heap_or_stack() {
-            HeapOrStackTag::Heap => {
-                Ref::heap_cell(self.value() as usize)
-            }
-            HeapOrStackTag::Stack => {
-                Ref::stack_cell(self.value() as usize)
-            }
+            HeapOrStackTag::Heap => Ref::heap_cell(self.value() as usize),
+            HeapOrStackTag::Stack => Ref::stack_cell(self.value() as usize),
         }
     }
 }
 
+pub trait ListElisionPolicy {
+    fn elide_lists() -> bool;
+}
+
 #[derive(Debug)]
-pub struct StackfulPreOrderHeapIter<'a> {
+pub struct ListElider {}
+
+impl ListElisionPolicy for ListElider {
+    #[inline(always)]
+    fn elide_lists() -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+pub struct NonListElider {}
+
+impl ListElisionPolicy for NonListElider {
+    #[inline(always)]
+    fn elide_lists() -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct StackfulPreOrderHeapIter<'a, ElideLists> {
     pub heap: &'a mut Vec<HeapCellValue>,
     pub machine_stack: &'a mut Stack,
     stack: Vec<IterStackLoc>,
     h: IterStackLoc,
+    _marker: PhantomData<ElideLists>,
 }
 
-impl<'a> Drop for StackfulPreOrderHeapIter<'a> {
+impl<'a, ElideLists> Drop for StackfulPreOrderHeapIter<'a, ElideLists> {
     fn drop(&mut self) {
         while let Some(h) = self.stack.pop() {
             let cell = self.read_cell_mut(h);
@@ -108,75 +271,35 @@ pub trait FocusedHeapIter: Iterator<Item = HeapCellValue> {
     fn focus(&self) -> IterStackLoc;
 }
 
-impl<'a> FocusedHeapIter for StackfulPreOrderHeapIter<'a> {
+impl<'a, ElideLists: ListElisionPolicy> FocusedHeapIter
+    for StackfulPreOrderHeapIter<'a, ElideLists>
+{
     #[inline]
     fn focus(&self) -> IterStackLoc {
         self.h
     }
 }
 
-impl<'a> StackfulPreOrderHeapIter<'a> {
-    #[inline]
-    fn new(heap: &'a mut Vec<HeapCellValue>, stack: &'a mut Stack, cell: HeapCellValue) -> Self {
-        let h = IterStackLoc::iterable_loc(heap.len(), HeapOrStackTag::Heap);
-        heap.push(cell);
-
-        Self {
-            heap,
-            h,
-            machine_stack: stack,
-            stack: vec![h],
-        }
-    }
-
-    #[inline]
-    fn forward_if_referent_marked(&mut self, loc: IterStackLoc) {
-        read_heap_cell!(self.read_cell(loc),
-            (HeapCellValueTag::Str |
-             HeapCellValueTag::Lis |
-             HeapCellValueTag::AttrVar |
-             HeapCellValueTag::Var |
-             HeapCellValueTag::PStrLoc, vh) => {
-                if self.heap[vh].get_mark_bit() {
-                    self.read_cell_mut(loc).set_forwarding_bit(true);
-                }
-            }
-            (HeapCellValueTag::StackVar, vs) => {
-                if self.machine_stack[vs].get_mark_bit() {
-                    self.read_cell_mut(loc).set_forwarding_bit(true);
-                }
-            }
-            _ => {}
-        );
-    }
-
-    #[inline]
-    pub fn push_stack(&mut self, h: IterStackLoc) {
-        self.stack.push(h);
-    }
-
+impl<'a, ElideLists> StackfulPreOrderHeapIter<'a, ElideLists> {
     #[inline]
     pub fn read_cell_mut(&mut self, loc: IterStackLoc) -> &mut HeapCellValue {
         match loc.heap_or_stack() {
-            HeapOrStackTag::Heap => {
-                &mut self.heap[loc.value() as usize]
-            }
-            HeapOrStackTag::Stack => {
-                &mut self.machine_stack[loc.value() as usize]
-            }
+            HeapOrStackTag::Heap => &mut self.heap[loc.value() as usize],
+            HeapOrStackTag::Stack => &mut self.machine_stack[loc.value() as usize],
         }
     }
 
     #[inline]
     pub fn read_cell(&self, loc: IterStackLoc) -> HeapCellValue {
         match loc.heap_or_stack() {
-            HeapOrStackTag::Heap => {
-                self.heap[loc.value() as usize]
-            }
-            HeapOrStackTag::Stack => {
-                self.machine_stack[loc.value() as usize]
-            }
+            HeapOrStackTag::Heap => self.heap[loc.value() as usize],
+            HeapOrStackTag::Stack => self.machine_stack[loc.value() as usize],
         }
+    }
+
+    #[inline]
+    pub fn push_stack(&mut self, h: IterStackLoc) {
+        self.stack.push(h);
     }
 
     #[inline]
@@ -218,25 +341,71 @@ impl<'a> StackfulPreOrderHeapIter<'a> {
         None
     }
 
-    #[inline]
-    pub fn stack_len(&self) -> usize {
-        self.stack.len()
-    }
-
     fn push_if_unmarked(&mut self, loc: IterStackLoc) {
         let cell = self.read_cell_mut(loc);
 
         if !cell.get_mark_bit() {
             cell.set_mark_bit(true);
-            self.stack.push(IterStackLoc::iterable_loc(loc.value() as usize, loc.heap_or_stack()));
+            self.stack.push(IterStackLoc::iterable_loc(
+                loc.value() as usize,
+                loc.heap_or_stack(),
+            ));
         }
+    }
+}
+
+impl<'a, ElideLists: ListElisionPolicy> StackfulPreOrderHeapIter<'a, ElideLists> {
+    #[inline]
+    fn new(heap: &'a mut Vec<HeapCellValue>, stack: &'a mut Stack, cell: HeapCellValue) -> Self {
+        let h = IterStackLoc::iterable_loc(heap.len(), HeapOrStackTag::Heap);
+        heap.push(cell);
+
+        Self {
+            heap,
+            h,
+            machine_stack: stack,
+            stack: vec![h],
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn forward_if_referent_marked(&mut self, loc: IterStackLoc) {
+        let cell = self.read_cell(loc);
+
+        read_heap_cell!(cell,
+            (HeapCellValueTag::Lis, vh) => {
+                let forward = if ElideLists::elide_lists() { true } else { cell.get_mark_bit() };
+
+                if forward && self.heap[vh].get_mark_bit() {
+                    self.read_cell_mut(loc).set_forwarding_bit(true);
+                }
+            }
+            (HeapCellValueTag::Str |
+             HeapCellValueTag::AttrVar |
+             HeapCellValueTag::Var |
+             HeapCellValueTag::PStrLoc, vh) => {
+                if self.heap[vh].get_mark_bit() {
+                    self.read_cell_mut(loc).set_forwarding_bit(true);
+                }
+            }
+            (HeapCellValueTag::StackVar, vs) => {
+                if self.machine_stack[vs].get_mark_bit() {
+                    self.read_cell_mut(loc).set_forwarding_bit(true);
+                }
+            }
+            _ => {}
+        );
     }
 
     fn follow(&mut self) -> Option<HeapCellValue> {
         while let Some(h) = self.stack.pop() {
             if h.is_pending_mark() {
                 self.push_if_unmarked(h);
-                self.stack.push(IterStackLoc::mark_loc(h.value() as usize, h.heap_or_stack()));
+                self.stack.push(IterStackLoc::mark_loc(
+                    h.value() as usize,
+                    h.heap_or_stack(),
+                ));
 
                 self.forward_if_referent_marked(h);
                 continue;
@@ -266,28 +435,27 @@ impl<'a> StackfulPreOrderHeapIter<'a> {
                (HeapCellValueTag::Lis, vh) => {
                    let loc = IterStackLoc::iterable_loc(vh, HeapOrStackTag::Heap);
 
+                   self.forward_if_referent_marked(loc);
                    self.push_if_unmarked(loc);
 
                    self.stack.push(IterStackLoc::pending_mark_loc(vh + 1, HeapOrStackTag::Heap));
                    self.stack.push(IterStackLoc::mark_loc(vh, HeapOrStackTag::Heap));
-
-                   self.forward_if_referent_marked(loc);
 
                    return Some(self.read_cell(h));
                }
                (HeapCellValueTag::AttrVar | HeapCellValueTag::Var, vh) => {
                    let loc = IterStackLoc::iterable_loc(vh, HeapOrStackTag::Heap);
 
+                   self.forward_if_referent_marked(loc);
                    self.push_if_unmarked(loc);
                    self.stack.push(IterStackLoc::mark_loc(vh, HeapOrStackTag::Heap));
-                   self.forward_if_referent_marked(loc);
                }
                (HeapCellValueTag::StackVar, vs) => {
                    let loc = IterStackLoc::iterable_loc(vs, HeapOrStackTag::Stack);
 
+                   self.forward_if_referent_marked(loc);
                    self.push_if_unmarked(loc);
                    self.stack.push(IterStackLoc::mark_loc(vs, HeapOrStackTag::Stack));
-                   self.forward_if_referent_marked(loc);
                }
                (HeapCellValueTag::PStrOffset, offset) => {
                    self.push_if_unmarked(IterStackLoc::iterable_loc(offset, HeapOrStackTag::Heap));
@@ -331,7 +499,7 @@ impl<'a> StackfulPreOrderHeapIter<'a> {
     }
 }
 
-impl<'a> Iterator for StackfulPreOrderHeapIter<'a> {
+impl<'a, ElideLists: ListElisionPolicy> Iterator for StackfulPreOrderHeapIter<'a, ElideLists> {
     type Item = HeapCellValue;
 
     #[inline]
@@ -340,21 +508,22 @@ impl<'a> Iterator for StackfulPreOrderHeapIter<'a> {
     }
 }
 
-#[cfg(test)]
 #[inline(always)]
-pub(crate) fn stackless_preorder_iter(
-    heap: &mut Vec<HeapCellValue>,
-    cell: HeapCellValue,
-) -> StacklessPreOrderHeapIter<IteratorUMP> {
-    StacklessPreOrderHeapIter::<IteratorUMP>::new(heap, cell)
+pub(crate) fn cycle_detecting_stackless_preorder_iter(
+    heap: &'_ mut [HeapCellValue],
+    start: usize,
+) -> CycleDetectingIter<'_, true> {
+    // const generics argument of true so that cycle discovery stops
+    // the iterator.
+    CycleDetectingIter::new(heap, start)
 }
 
 #[inline(always)]
-pub(crate) fn stackful_preorder_iter<'a>(
+pub(crate) fn stackful_preorder_iter<'a, ElideLists: ListElisionPolicy>(
     heap: &'a mut Vec<HeapCellValue>,
     stack: &'a mut Stack,
     cell: HeapCellValue,
-) -> StackfulPreOrderHeapIter<'a> {
+) -> StackfulPreOrderHeapIter<'a, ElideLists> {
     StackfulPreOrderHeapIter::new(heap, stack, cell)
 }
 
@@ -461,13 +630,14 @@ impl<Iter: FocusedHeapIter> PostOrderIterator<Iter> {
     }
 }
 
-pub(crate) type LeftistPostOrderHeapIter<'a> = PostOrderIterator<StackfulPreOrderHeapIter<'a>>;
+pub(crate) type LeftistPostOrderHeapIter<'a, ElideLists> =
+    PostOrderIterator<StackfulPreOrderHeapIter<'a, ElideLists>>;
 
-impl<'a> LeftistPostOrderHeapIter<'a> {
+impl<'a, ElideLists: ListElisionPolicy> LeftistPostOrderHeapIter<'a, ElideLists> {
     #[inline]
     pub fn pop_stack(&mut self) {
         if let Some((child_count, ..)) = self.parent_stack.last() {
-            for _ in 0 .. *child_count {
+            for _ in 0..*child_count {
                 self.base_iter.pop_stack();
             }
 
@@ -482,34 +652,41 @@ impl<'a> LeftistPostOrderHeapIter<'a> {
 }
 
 #[inline]
-pub(crate) fn stackful_post_order_iter<'a>(
+pub(crate) fn stackful_post_order_iter<'a, ElideLists: ListElisionPolicy>(
     heap: &'a mut Heap,
     stack: &'a mut Stack,
     cell: HeapCellValue,
-) -> LeftistPostOrderHeapIter<'a> {
+) -> LeftistPostOrderHeapIter<'a, ElideLists> {
     PostOrderIterator::new(StackfulPreOrderHeapIter::new(heap, stack, cell))
-}
-
-#[cfg(test)]
-pub(crate) type RightistPostOrderHeapIter<'a> =
-    PostOrderIterator<StacklessPreOrderHeapIter<'a, IteratorUMP>>;
-
-#[cfg(test)]
-#[inline]
-pub(crate) fn stackless_post_order_iter<'a>(
-    heap: &'a mut Heap,
-    cell: HeapCellValue,
-) -> RightistPostOrderHeapIter<'a> {
-    PostOrderIterator::new(stackless_preorder_iter(heap, cell))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::gc::IteratorUMP;
     use crate::machine::mock_wam::*;
 
+    pub(crate) type RightistPostOrderHeapIter<'a> =
+        PostOrderIterator<StacklessPreOrderHeapIter<'a, IteratorUMP>>;
+
+    #[inline(always)]
+    pub(crate) fn stackless_preorder_iter(
+        heap: &mut [HeapCellValue],
+        start: usize,
+    ) -> StacklessPreOrderHeapIter<IteratorUMP> {
+        StacklessPreOrderHeapIter::<IteratorUMP>::new(heap, start)
+    }
+
+    #[inline]
+    pub(crate) fn stackless_post_order_iter(
+        heap: &'_ mut Heap,
+        start: usize,
+    ) -> RightistPostOrderHeapIter {
+        PostOrderIterator::new(stackless_preorder_iter(heap, start))
+    }
 
     #[test]
+    #[cfg_attr(miri, ignore = "it takes too long to run")]
     fn heap_stackless_iter_tests() {
         let mut wam = MockWAM::new();
 
@@ -518,11 +695,13 @@ mod tests {
         let b_atom = atom!("b");
 
         wam.machine_st
-           .heap
-           .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
+            .heap
+            .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
+
+        wam.machine_st.heap.push(str_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, str_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 3);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -554,8 +733,10 @@ mod tests {
             ]
         ));
 
+        wam.machine_st.heap.push(str_loc_as_cell!(0));
+
         for _ in 0..20 {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, str_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 5);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -598,7 +779,7 @@ mod tests {
         ));
 
         for _ in 0..200000 {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -629,12 +810,12 @@ mod tests {
         {
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(0),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), heap_loc_as_cell!(0));
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                heap_loc_as_cell!(0)
+            );
             assert_eq!(iter.next(), None);
         }
 
@@ -650,10 +831,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(0),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -688,10 +866,7 @@ mod tests {
         wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(0),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -721,11 +896,14 @@ mod tests {
 
         // first a 'dangling' partial string, later modified to be a two-part complete string,
         // then a three-part cyclic string involving an uncompacted list of chars.
-        let pstr_var_cell = put_partial_string(&mut wam.machine_st.heap, "abc ", &mut wam.machine_st.atom_tbl);
+        let pstr_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "abc ", &wam.machine_st.atom_tbl);
         let pstr_cell = wam.machine_st.heap[pstr_var_cell.get_value() as usize];
 
+        wam.machine_st.heap.push(pstr_loc_as_cell!(0));
+
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 2);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
             assert_eq!(
@@ -739,49 +917,51 @@ mod tests {
         assert_eq!(wam.machine_st.heap[0], pstr_cell);
         assert_eq!(wam.machine_st.heap[1], heap_loc_as_cell!(1));
 
-        wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(2));
+        wam.machine_st.heap[1] = pstr_loc_as_cell!(3);
 
-        let pstr_second_var_cell = put_partial_string(
-            &mut wam.machine_st.heap,
-            "def",
-            &mut wam.machine_st.atom_tbl,
-        );
+        let pstr_second_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "def", &wam.machine_st.atom_tbl);
 
         let pstr_second_cell = wam.machine_st.heap[pstr_second_var_cell.get_value() as usize];
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 2);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                heap_loc_as_cell!(3),
+                heap_loc_as_cell!(4),
             );
 
             assert!(iter.next().is_none());
         }
 
         assert_eq!(wam.machine_st.heap[0], pstr_cell);
-        assert_eq!(wam.machine_st.heap[1], pstr_loc_as_cell!(2));
-        assert_eq!(wam.machine_st.heap[2], pstr_second_cell);
-        assert_eq!(wam.machine_st.heap[3], heap_loc_as_cell!(3));
+        assert_eq!(wam.machine_st.heap[1], pstr_loc_as_cell!(3));
+        assert_eq!(wam.machine_st.heap[2], pstr_loc_as_cell!(0));
+        assert_eq!(wam.machine_st.heap[3], pstr_second_cell);
+        assert_eq!(wam.machine_st.heap[4], heap_loc_as_cell!(4));
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(4));
+        wam.machine_st.heap.push(pstr_loc_as_cell!(5));
         wam.machine_st.heap.push(pstr_offset_as_cell!(0));
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(2)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(2)));
+
+        wam.machine_st.heap[2] = heap_loc_as_cell!(4);
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                pstr_loc_as_cell!(4),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 2);
 
             let pstr_offset_cell = pstr_offset_as_cell!(0);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_cell);
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                fixnum_as_cell!(Fixnum::build_with(2))
+            );
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
 
@@ -789,52 +969,92 @@ mod tests {
         }
 
         assert_eq!(unmark_cell_bits!(wam.machine_st.heap[0]), pstr_cell);
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[1]), pstr_loc_as_cell!(2));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[2]), pstr_second_cell);
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[3]), pstr_loc_as_cell!(4));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[4]), pstr_offset_as_cell!(0));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[5]), fixnum_as_cell!(Fixnum::build_with(2)));
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[1]),
+            pstr_loc_as_cell!(3)
+        );
+        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[3]), pstr_second_cell);
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[4]),
+            pstr_loc_as_cell!(5)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[5]),
+            pstr_offset_as_cell!(0)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[6]),
+            fixnum_as_cell!(Fixnum::build_with(2))
+        );
 
         wam.machine_st.heap.truncate(4);
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
+        wam.machine_st
+            .heap
+            .push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
 
         wam.machine_st.heap.push(pstr_offset_as_cell!(0));
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(0i64)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(0i64)));
+
+        wam.machine_st.heap.push(pstr_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 6);
             let pstr_offset_cell = pstr_offset_as_cell!(0);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                pstr_loc_as_cell!(4)
+            );
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_cell);
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                fixnum_as_cell!(Fixnum::build_with(0))
+            );
 
             assert_eq!(iter.next(), None);
         }
 
         all_cells_unmarked(&wam.machine_st.heap);
 
-        wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(1i64)));
+        wam.machine_st.heap[5] = fixnum_as_cell!(Fixnum::build_with(1i64));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 6);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                pstr_loc_as_cell!(4)
+            );
 
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                pstr_offset_as_cell!(0)
+            );
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                pstr_offset_as_cell!(0)
+            );
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                fixnum_as_cell!(Fixnum::build_with(1))
+            );
 
             assert_eq!(iter.next(), None);
-
-            assert_eq!(iter.heap[4], pstr_offset_as_cell!(0));
-            assert_eq!(iter.heap[5], fixnum_as_cell!(Fixnum::build_with(1i64)));
         }
+
+        assert_eq!(wam.machine_st.heap[4], pstr_offset_as_cell!(0));
+        assert_eq!(
+            wam.machine_st.heap[5],
+            fixnum_as_cell!(Fixnum::build_with(1i64))
+        );
 
         all_cells_unmarked(&wam.machine_st.heap);
 
@@ -851,7 +1071,7 @@ mod tests {
         wam.machine_st.heap.extend(functor);
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -888,26 +1108,13 @@ mod tests {
                 atom_as_cell!(f_atom, 3)
             );
 
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(a_atom)
-            );
-
             assert_eq!(iter.next(), None);
         }
 
         all_cells_unmarked(&wam.machine_st.heap);
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -954,7 +1161,7 @@ mod tests {
         assert_eq!(wam.machine_st.heap[4], empty_list_as_cell!());
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -986,7 +1193,7 @@ mod tests {
         wam.machine_st.heap[4] = list_loc_as_cell!(1);
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -1024,19 +1231,6 @@ mod tests {
                 atom_as_cell!(f_atom, 3)
             );
 
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(a_atom)
-            );
-
             assert_eq!(iter.next(), None);
         }
 
@@ -1048,21 +1242,33 @@ mod tests {
         wam.machine_st.heap.push(heap_loc_as_cell!(2));
         wam.machine_st.heap.push(heap_loc_as_cell!(3));
         wam.machine_st.heap.push(heap_loc_as_cell!(3));
+        wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 4);
 
             assert_eq!(iter.next().unwrap(), heap_loc_as_cell!(3));
-
             assert_eq!(iter.next(), None);
         }
 
         all_cells_unmarked(&wam.machine_st.heap);
 
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[0]), heap_loc_as_cell!(1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[1]), heap_loc_as_cell!(2));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[2]), heap_loc_as_cell!(3));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[3]), heap_loc_as_cell!(3));
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[0]),
+            heap_loc_as_cell!(1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[1]),
+            heap_loc_as_cell!(2)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[2]),
+            heap_loc_as_cell!(3)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[3]),
+            heap_loc_as_cell!(3)
+        );
 
         wam.machine_st.heap.clear();
 
@@ -1072,26 +1278,35 @@ mod tests {
         wam.machine_st.heap.push(list_loc_as_cell!(1));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(iter.next().unwrap(), list_loc_as_cell!(1));
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
                 list_loc_as_cell!(1)
             );
-
-            assert_eq!(iter.next().unwrap(), list_loc_as_cell!(1));
-            // this is what happens! this next line! We would like it not to happen though.
-            assert_eq!(iter.next().unwrap(), list_loc_as_cell!(1));
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                list_loc_as_cell!(1)
+            );
 
             assert_eq!(iter.next(), None);
         }
 
         all_cells_unmarked(&wam.machine_st.heap);
 
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[0]), list_loc_as_cell!(1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[1]), list_loc_as_cell!(1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[2]), list_loc_as_cell!(1));
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[0]),
+            list_loc_as_cell!(1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[1]),
+            list_loc_as_cell!(1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[2]),
+            list_loc_as_cell!(1)
+        );
 
         wam.machine_st.heap.clear();
 
@@ -1110,9 +1325,10 @@ mod tests {
 
         wam.machine_st.heap.push(attr_var_as_cell!(11)); // linked from 7.
         wam.machine_st.heap.push(heap_loc_as_cell!(12));
+        wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 13);
 
             assert_eq!(iter.next().unwrap(), list_loc_as_cell!(1));
 
@@ -1152,6 +1368,7 @@ mod tests {
         let p_atom = atom!("p");
 
         wam.machine_st.heap.pop();
+        wam.machine_st.heap.pop();
 
         wam.machine_st.heap.push(heap_loc_as_cell!(13)); // 12
         wam.machine_st.heap.push(list_loc_as_cell!(14)); // 13
@@ -1165,9 +1382,10 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!()); // 21
         wam.machine_st.heap.push(atom_as_cell!(p_atom, 1)); // 22
         wam.machine_st.heap.push(heap_loc_as_cell!(23)); // 23
+        wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 24);
 
             assert_eq!(iter.next().unwrap(), list_loc_as_cell!(1));
 
@@ -1202,38 +1420,111 @@ mod tests {
             assert_eq!(iter.next(), None);
         }
 
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[0]), list_loc_as_cell!(1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[1]), heap_loc_as_cell!(1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[2]), heap_loc_as_cell!(3));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[3]), list_loc_as_cell!(4));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[4]), str_loc_as_cell!(6));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[5]), heap_loc_as_cell!(8));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[6]), atom_as_cell!(f_atom, 1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[7]), heap_loc_as_cell!(11));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[8]), list_loc_as_cell!(9));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[9]), heap_loc_as_cell!(9));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[10]), empty_list_as_cell!());
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[11]), attr_var_as_cell!(11));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[12]), heap_loc_as_cell!(13));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[13]), list_loc_as_cell!(14));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[14]), str_loc_as_cell!(16));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[15]), heap_loc_as_cell!(19));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[16]), atom_as_cell!(clpz_atom, 2));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[17]), atom_as_cell!(a_atom));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[18]), atom_as_cell!(b_atom));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[19]), list_loc_as_cell!(20));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[20]), str_loc_as_cell!(22));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[21]), empty_list_as_cell!());
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[22]), atom_as_cell!(p_atom, 1));
-        assert_eq!(unmark_cell_bits!(wam.machine_st.heap[23]), heap_loc_as_cell!(23));
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[0]),
+            list_loc_as_cell!(1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[1]),
+            heap_loc_as_cell!(1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[2]),
+            heap_loc_as_cell!(3)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[3]),
+            list_loc_as_cell!(4)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[4]),
+            str_loc_as_cell!(6)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[5]),
+            heap_loc_as_cell!(8)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[6]),
+            atom_as_cell!(f_atom, 1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[7]),
+            heap_loc_as_cell!(11)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[8]),
+            list_loc_as_cell!(9)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[9]),
+            heap_loc_as_cell!(9)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[10]),
+            empty_list_as_cell!()
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[11]),
+            attr_var_as_cell!(11)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[12]),
+            heap_loc_as_cell!(13)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[13]),
+            list_loc_as_cell!(14)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[14]),
+            str_loc_as_cell!(16)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[15]),
+            heap_loc_as_cell!(19)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[16]),
+            atom_as_cell!(clpz_atom, 2)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[17]),
+            atom_as_cell!(a_atom)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[18]),
+            atom_as_cell!(b_atom)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[19]),
+            list_loc_as_cell!(20)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[20]),
+            str_loc_as_cell!(22)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[21]),
+            empty_list_as_cell!()
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[22]),
+            atom_as_cell!(p_atom, 1)
+        );
+        assert_eq!(
+            unmark_cell_bits!(wam.machine_st.heap[23]),
+            heap_loc_as_cell!(23)
+        );
 
         wam.machine_st.heap.clear();
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                fixnum_as_cell!(Fixnum::build_with(0))
-            );
+            wam.machine_st
+                .heap
+                .push(fixnum_as_cell!(Fixnum::build_with(0)));
+
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -1245,25 +1536,20 @@ mod tests {
 
         all_cells_unmarked(&wam.machine_st.heap);
 
-        assert_eq!(wam.machine_st.heap.len(), 0);
-
         wam.machine_st.heap.clear();
 
         wam.machine_st.heap.push(str_loc_as_cell!(1));
 
-        wam.machine_st.heap.push(atom_as_cell!(atom!("g"),2));
+        wam.machine_st.heap.push(atom_as_cell!(atom!("g"), 2));
         wam.machine_st.heap.push(heap_loc_as_cell!(0));
         wam.machine_st.heap.push(atom_as_cell!(atom!("y")));
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                str_loc_as_cell!(1),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(atom!("g"),2)
+                atom_as_cell!(atom!("g"), 2)
             );
 
             assert_eq!(
@@ -1273,7 +1559,7 @@ mod tests {
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                str_loc_as_cell!(1)
+                heap_loc_as_cell!(0)
             );
 
             assert!(iter.next().is_none());
@@ -1283,19 +1569,17 @@ mod tests {
 
         wam.machine_st.heap.clear();
 
-        wam.machine_st.heap.push(atom_as_cell!(atom!("g"),2));
+        wam.machine_st.heap.push(atom_as_cell!(atom!("g"), 2));
         wam.machine_st.heap.push(str_loc_as_cell!(0));
         wam.machine_st.heap.push(atom_as_cell!(atom!("y")));
+        wam.machine_st.heap.push(str_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                str_loc_as_cell!(0),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 3);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(atom!("g"),2)
+                atom_as_cell!(atom!("g"), 2)
             );
 
             assert_eq!(
@@ -1303,10 +1587,7 @@ mod tests {
                 atom_as_cell!(atom!("y"))
             );
 
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                str_loc_as_cell!(0)
-            );
+            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), str_loc_as_cell!(0));
 
             assert!(iter.next().is_none());
         }
@@ -1327,10 +1608,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(7),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 7);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -1388,12 +1666,10 @@ mod tests {
         wam.machine_st.heap.push(atom_as_cell!(atom!("f"), 2));
         wam.machine_st.heap.push(heap_loc_as_cell!(1));
         wam.machine_st.heap.push(heap_loc_as_cell!(1));
+        wam.machine_st.heap.push(str_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                str_loc_as_cell!(0),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 3);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -1420,41 +1696,69 @@ mod tests {
         wam.machine_st.heap.clear();
 
         // representation of one of the heap terms as in issue #1384.
-/*
-        wam.machine_st.heap.push(list_loc_as_cell!(7));
+        wam.machine_st.heap.push(list_loc_as_cell!(7)); // 0
+        wam.machine_st.heap.push(heap_loc_as_cell!(0)); // 1
+        wam.machine_st.heap.push(list_loc_as_cell!(3)); // 2
+        wam.machine_st.heap.push(list_loc_as_cell!(5)); // 3
+        wam.machine_st.heap.push(empty_list_as_cell!()); // 4
+        wam.machine_st.heap.push(heap_loc_as_cell!(2)); // 5
+        wam.machine_st.heap.push(heap_loc_as_cell!(2)); // 6
+        wam.machine_st.heap.push(empty_list_as_cell!()); // 7
+        wam.machine_st.heap.push(heap_loc_as_cell!(3)); // 8
+
         wam.machine_st.heap.push(heap_loc_as_cell!(0));
-        wam.machine_st.heap.push(list_loc_as_cell!(3));
-        wam.machine_st.heap.push(list_loc_as_cell!(5));
-        wam.machine_st.heap.push(empty_list_as_cell!());
-        wam.machine_st.heap.push(heap_loc_as_cell!(2));
-        wam.machine_st.heap.push(heap_loc_as_cell!(2));
-        wam.machine_st.heap.push(empty_list_as_cell!());
-        wam.machine_st.heap.push(heap_loc_as_cell!(3));
 
         {
-            let mut iter = stackless_preorder_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(0),
-            );
+            let mut iter = stackless_preorder_iter(&mut wam.machine_st.heap, 9);
 
+            /*
             while let Some(_) = iter.next() {
                 print_heap_terms(iter.heap.iter(), 0);
                 println!("");
             }
+            */
 
-            /*
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(atom!("f"), 2)
+                list_loc_as_cell!(7)
             );
 
-            assert!(iter.next().is_none());
-            */
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                list_loc_as_cell!(5)
+            );
+
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                heap_loc_as_cell!(2)
+            );
+
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                list_loc_as_cell!(3)
+            );
+
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                empty_list_as_cell!()
+            );
+
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                heap_loc_as_cell!(2)
+            );
+
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                empty_list_as_cell!()
+            );
+
+            assert_eq!(iter.next(), None);
         }
-*/
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "blocked on atom_table.rs UB")]
     fn heap_stackful_iter_tests() {
         let mut wam = MockWAM::new();
 
@@ -1462,11 +1766,12 @@ mod tests {
         let a_atom = atom!("a");
         let b_atom = atom!("b");
 
-        wam.machine_st.heap
+        wam.machine_st
+            .heap
             .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 str_loc_as_cell!(0),
@@ -1501,7 +1806,7 @@ mod tests {
         ));
 
         for _ in 0..20 {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 str_loc_as_cell!(0),
@@ -1533,7 +1838,7 @@ mod tests {
         {
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1560,7 +1865,7 @@ mod tests {
             wam.machine_st.heap.push(heap_loc_as_cell!(1));
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1584,7 +1889,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1620,7 +1925,7 @@ mod tests {
         wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1652,7 +1957,7 @@ mod tests {
         }
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1686,11 +1991,12 @@ mod tests {
         // two-part complete string, then a three-part cyclic string
         // involving an uncompacted list of chars.
 
-        let pstr_var_cell = put_partial_string(&mut wam.machine_st.heap, "abc ", &mut wam.machine_st.atom_tbl);
+        let pstr_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "abc ", &wam.machine_st.atom_tbl);
         let pstr_cell = wam.machine_st.heap[pstr_var_cell.get_value() as usize];
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1710,11 +2016,12 @@ mod tests {
         wam.machine_st.heap.pop();
         wam.machine_st.heap.push(heap_loc_as_cell!(2));
 
-        let pstr_second_var_cell = put_partial_string(&mut wam.machine_st.heap, "def", &mut wam.machine_st.atom_tbl);
+        let pstr_second_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "def", &wam.machine_st.atom_tbl);
         let pstr_second_cell = wam.machine_st.heap[pstr_second_var_cell.get_value() as usize];
 
         {
-            let mut iter = stackful_preorder_iter(
+            let mut iter = stackful_preorder_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1731,13 +2038,17 @@ mod tests {
         }
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
+        wam.machine_st
+            .heap
+            .push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
 
         wam.machine_st.heap.push(pstr_offset_as_cell!(0));
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(0i64)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(0i64)));
 
         {
-            let mut iter = stackful_preorder_iter(
+            let mut iter = stackful_preorder_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 pstr_loc_as_cell!(0),
@@ -1750,7 +2061,10 @@ mod tests {
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_cell);
-            assert_eq!(iter.next().unwrap(), fixnum_as_cell!(Fixnum::build_with(0i64)));
+            assert_eq!(
+                iter.next().unwrap(),
+                fixnum_as_cell!(Fixnum::build_with(0i64))
+            );
 
             assert_eq!(iter.next(), None);
         }
@@ -1764,10 +2078,12 @@ mod tests {
         */
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(1i64)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(1i64)));
 
         {
-            let mut iter = stackful_preorder_iter(
+            let mut iter = stackful_preorder_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 pstr_loc_as_cell!(0),
@@ -1781,13 +2097,19 @@ mod tests {
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_cell);
-            assert_eq!(iter.next().unwrap(), fixnum_as_cell!(Fixnum::build_with(1i64)));
+            assert_eq!(
+                iter.next().unwrap(),
+                fixnum_as_cell!(Fixnum::build_with(1i64))
+            );
 
             let h = iter.focus();
 
             assert_eq!(h.value(), 5);
             assert_eq!(unmark_cell_bits!(iter.heap[4]), pstr_offset_as_cell!(0));
-            assert_eq!(unmark_cell_bits!(iter.heap[5]), fixnum_as_cell!(Fixnum::build_with(1i64)));
+            assert_eq!(
+                unmark_cell_bits!(iter.heap[5]),
+                fixnum_as_cell!(Fixnum::build_with(1i64))
+            );
 
             assert_eq!(iter.next(), None);
         }
@@ -1805,7 +2127,7 @@ mod tests {
         wam.machine_st.heap.extend(functor);
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1868,7 +2190,7 @@ mod tests {
         wam.machine_st.heap[4] = list_loc_as_cell!(1);
 
         {
-            let mut iter = stackful_preorder_iter(
+            let mut iter = stackful_preorder_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1937,7 +2259,7 @@ mod tests {
         wam.machine_st.heap.push(list_loc_as_cell!(1));
 
         {
-            let mut iter = StackfulPreOrderHeapIter::new(
+            let mut iter = StackfulPreOrderHeapIter::<NonListElider>::new(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1957,6 +2279,8 @@ mod tests {
                 list_loc_as_cell!(1)
             );
             assert_eq!(iter.next().unwrap(), cyclic_link);
+            assert_eq!(iter.next().unwrap(), cyclic_link);
+            assert_eq!(iter.next().unwrap(), cyclic_link);
 
             assert_eq!(iter.next(), None);
         }
@@ -1969,7 +2293,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = stackful_preorder_iter(
+            let mut iter = stackful_preorder_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -1980,10 +2304,7 @@ mod tests {
                 pstr_as_cell!(atom!("a string"))
             );
 
-            assert_eq!(
-                iter.next().unwrap(),
-                empty_list_as_cell!()
-            );
+            assert_eq!(iter.next().unwrap(), empty_list_as_cell!());
 
             assert_eq!(iter.next(), None);
         }
@@ -2004,7 +2325,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = stackful_preorder_iter(
+            let mut iter = stackful_preorder_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2030,6 +2351,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "blocked on atom_table.rs UB")]
     fn heap_stackful_post_order_iter() {
         let mut wam = MockWAM::new();
 
@@ -2037,11 +2359,12 @@ mod tests {
         let a_atom = atom!("a");
         let b_atom = atom!("b");
 
-        wam.machine_st.heap
+        wam.machine_st
+            .heap
             .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 str_loc_as_cell!(0),
@@ -2075,8 +2398,9 @@ mod tests {
             ]
         ));
 
-        for _ in 0..20 { // 0000 {
-            let mut iter = stackful_post_order_iter(
+        for _ in 0..20 {
+            // 0000 {
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 str_loc_as_cell!(0),
@@ -2110,7 +2434,7 @@ mod tests {
         {
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2137,7 +2461,7 @@ mod tests {
             wam.machine_st.heap.push(heap_loc_as_cell!(1));
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2161,7 +2485,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2197,7 +2521,7 @@ mod tests {
         wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2229,7 +2553,7 @@ mod tests {
         }
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2263,11 +2587,12 @@ mod tests {
         // two-part complete string, then a three-part cyclic string
         // involving an uncompacted list of chars.
 
-        let pstr_var_cell = put_partial_string(&mut wam.machine_st.heap, "abc ", &mut wam.machine_st.atom_tbl);
+        let pstr_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "abc ", &wam.machine_st.atom_tbl);
         let pstr_cell = wam.machine_st.heap[pstr_var_cell.get_value() as usize];
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 pstr_loc_as_cell!(0),
@@ -2286,11 +2611,12 @@ mod tests {
         wam.machine_st.heap.pop();
         wam.machine_st.heap.push(pstr_loc_as_cell!(2));
 
-        let pstr_second_var_cell = put_partial_string(&mut wam.machine_st.heap, "def", &mut wam.machine_st.atom_tbl);
+        let pstr_second_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "def", &wam.machine_st.atom_tbl);
         let pstr_second_cell = wam.machine_st.heap[pstr_second_var_cell.get_value() as usize];
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 pstr_loc_as_cell!(0),
@@ -2307,20 +2633,30 @@ mod tests {
         }
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
+        wam.machine_st
+            .heap
+            .push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
 
         wam.machine_st.heap.push(pstr_offset_as_cell!(0));
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(0i64)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(0i64)));
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 pstr_loc_as_cell!(0),
             );
 
-            assert_eq!(iter.next().unwrap(), fixnum_as_cell!(Fixnum::build_with(0i64)));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
+            assert_eq!(
+                iter.next().unwrap(),
+                fixnum_as_cell!(Fixnum::build_with(0i64))
+            );
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                pstr_offset_as_cell!(0)
+            );
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
@@ -2329,17 +2665,25 @@ mod tests {
         }
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(1i64)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(1i64)));
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 pstr_loc_as_cell!(0),
             );
 
-            assert_eq!(iter.next().unwrap(), fixnum_as_cell!(Fixnum::build_with(1i64)));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
+            assert_eq!(
+                iter.next().unwrap(),
+                fixnum_as_cell!(Fixnum::build_with(1i64))
+            );
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                pstr_offset_as_cell!(0)
+            );
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
@@ -2360,7 +2704,7 @@ mod tests {
         wam.machine_st.heap.extend(functor);
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2424,7 +2768,7 @@ mod tests {
         wam.machine_st.heap[4] = list_loc_as_cell!(1);
 
         {
-            let mut iter = stackful_post_order_iter(
+            let mut iter = stackful_post_order_iter::<NonListElider>(
                 &mut wam.machine_st.heap,
                 &mut wam.machine_st.stack,
                 heap_loc_as_cell!(0),
@@ -2491,6 +2835,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "blocked on atom_table.rs UB")]
     fn heap_stackless_post_order_iter() {
         let mut wam = MockWAM::new();
 
@@ -2498,13 +2843,14 @@ mod tests {
         let a_atom = atom!("a");
         let b_atom = atom!("b");
 
-        wam.machine_st.heap.extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
+        wam.machine_st
+            .heap
+            .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
+
+        wam.machine_st.heap.push(str_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_post_order_iter(
-                &mut wam.machine_st.heap,
-                str_loc_as_cell!(0),
-            );
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 3);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2534,11 +2880,10 @@ mod tests {
             ]
         ));
 
+        wam.machine_st.heap.push(str_loc_as_cell!(0));
+
         for _ in 0..20 {
-            let mut iter = stackless_post_order_iter(
-                &mut wam.machine_st.heap,
-                str_loc_as_cell!(0),
-            );
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 5);
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), str_loc_as_cell!(0));
 
@@ -2568,10 +2913,7 @@ mod tests {
         {
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = stackless_post_order_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(0),
-            );
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2587,10 +2929,7 @@ mod tests {
             wam.machine_st.heap.push(heap_loc_as_cell!(1));
             wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
-            let mut iter = stackless_post_order_iter(
-                &mut wam.machine_st.heap,
-                heap_loc_as_cell!(0),
-            );
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2615,7 +2954,7 @@ mod tests {
         wam.machine_st.heap.push(empty_list_as_cell!());
 
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2647,7 +2986,7 @@ mod tests {
         wam.machine_st.heap.push(heap_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 0);
 
             // the cycle will be iterated twice before being detected.
             assert_eq!(
@@ -2675,7 +3014,7 @@ mod tests {
         }
 
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 0);
 
             // cut the iteration short to check that all cells are
             // unmarked and unforwarded by the Drop instance of
@@ -2705,11 +3044,14 @@ mod tests {
         // two-part complete string, then a three-part cyclic string
         // involving an uncompacted list of chars.
 
-        let pstr_var_cell = put_partial_string(&mut wam.machine_st.heap, "abc ", &mut wam.machine_st.atom_tbl);
+        let pstr_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "abc ", &wam.machine_st.atom_tbl);
         let pstr_cell = wam.machine_st.heap[pstr_var_cell.get_value() as usize];
 
+        wam.machine_st.heap.push(pstr_loc_as_cell!(0));
+
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 2);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2722,18 +3064,18 @@ mod tests {
         }
 
         wam.machine_st.heap.pop();
+        wam.machine_st.heap.pop();
         wam.machine_st.heap.push(pstr_loc_as_cell!(2));
 
-        let pstr_second_var_cell = put_partial_string(
-            &mut wam.machine_st.heap,
-            "def",
-            &mut wam.machine_st.atom_tbl,
-        );
+        let pstr_second_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "def", &wam.machine_st.atom_tbl);
 
         let pstr_second_cell = wam.machine_st.heap[pstr_second_var_cell.get_value() as usize];
 
+        wam.machine_st.heap.push(pstr_loc_as_cell!(0));
+
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 4);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2749,20 +3091,28 @@ mod tests {
         all_cells_unmarked(&wam.machine_st.heap);
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
+        wam.machine_st
+            .heap
+            .push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
 
         wam.machine_st.heap.push(pstr_offset_as_cell!(0));
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(0)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(0)));
+
+        wam.machine_st.heap.push(pstr_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 7);
             let mut pstr_loc_cell = pstr_loc_as_cell!(0);
 
             pstr_loc_cell.set_forwarding_bit(true);
 
             // assert_eq!(iter.next().unwrap(), fixnum_as_cell!(Fixnum::build_with(0i64)));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                heap_loc_as_cell!(3)
+            );
 
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
@@ -2773,18 +3123,23 @@ mod tests {
         all_cells_unmarked(&wam.machine_st.heap);
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(1)));
+        wam.machine_st.heap.pop();
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(1)));
+
+        wam.machine_st.heap.push(pstr_loc_as_cell!(0));
 
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, pstr_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 7);
 
             //assert_eq!(iter.next().unwrap(), fixnum_as_cell!(Fixnum::build_with(1)));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
-            assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_offset_as_cell!(0));
-
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                heap_loc_as_cell!(3)
+            );
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_second_cell);
             assert_eq!(unmark_cell_bits!(iter.next().unwrap()), pstr_cell);
-
             assert_eq!(iter.next(), None);
         }
 
@@ -2800,8 +3155,10 @@ mod tests {
 
         wam.machine_st.heap.extend(functor);
 
+        wam.machine_st.heap.push(heap_loc_as_cell!(0));
+
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 9);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2833,18 +3190,6 @@ mod tests {
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(a_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
                 atom_as_cell!(f_atom, 3)
             );
 
@@ -2861,7 +3206,7 @@ mod tests {
         wam.machine_st.heap[4] = list_loc_as_cell!(1);
 
         {
-            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, heap_loc_as_cell!(0));
+            let mut iter = stackless_post_order_iter(&mut wam.machine_st.heap, 0);
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
@@ -2883,23 +3228,13 @@ mod tests {
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(b_atom)
-            );
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
-                atom_as_cell!(a_atom)
-            );
-
-            assert_eq!(
-                unmark_cell_bits!(iter.next().unwrap()),
                 atom_as_cell!(f_atom, 3)
             );
 
-            assert_eq!(iter.next().unwrap(), list_loc_as_cell!(1));
+            assert_eq!(
+                unmark_cell_bits!(iter.next().unwrap()),
+                list_loc_as_cell!(1)
+            );
 
             assert_eq!(
                 unmark_cell_bits!(iter.next().unwrap()),

@@ -30,12 +30,6 @@ pub struct Stack {
     _marker: PhantomData<HeapCellValue>,
 }
 
-impl Drop for Stack {
-    fn drop(&mut self) {
-        self.buf.deallocate();
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct AndFramePrelude {
     pub(crate) num_cells: usize,
@@ -62,7 +56,7 @@ impl Index<usize> for AndFrame {
         let index_offset = (index - 1) * mem::size_of::<HeapCellValue>();
 
         unsafe {
-            let ptr = mem::transmute::<&AndFrame, *const u8>(self);
+            let ptr = self as *const crate::machine::stack::AndFrame as *const u8;
             let ptr = ptr as usize + prelude_offset + index_offset;
 
             &*(ptr as *const HeapCellValue)
@@ -76,7 +70,7 @@ impl IndexMut<usize> for AndFrame {
         let index_offset = (index - 1) * mem::size_of::<HeapCellValue>();
 
         unsafe {
-            let ptr = mem::transmute::<&mut AndFrame, *const u8>(self);
+            let ptr = self as *mut crate::machine::stack::AndFrame as *const u8;
             let ptr = ptr as usize + prelude_offset + index_offset;
 
             &mut *(ptr as *mut HeapCellValue)
@@ -135,7 +129,7 @@ impl Index<usize> for OrFrame {
         let index_offset = index * mem::size_of::<HeapCellValue>();
 
         unsafe {
-            let ptr = mem::transmute::<&OrFrame, *const u8>(self);
+            let ptr = self as *const crate::machine::stack::OrFrame as *const u8;
             let ptr = ptr as usize + prelude_offset + index_offset;
 
             &*(ptr as *const HeapCellValue)
@@ -150,7 +144,7 @@ impl IndexMut<usize> for OrFrame {
         let index_offset = index * mem::size_of::<HeapCellValue>();
 
         unsafe {
-            let ptr = mem::transmute::<&mut OrFrame, *const u8>(self);
+            let ptr = self as *mut crate::machine::stack::OrFrame as *const u8;
             let ptr = ptr as usize + prelude_offset + index_offset;
 
             &mut *(ptr as *mut HeapCellValue)
@@ -189,13 +183,13 @@ impl Stack {
         let frame_size = AndFrame::size_of(num_cells);
 
         unsafe {
-            let e = self.buf.ptr as usize - self.buf.base as usize;
+            let e = (*self.buf.ptr.get_mut()) as usize - self.buf.base as usize;
             let new_ptr = self.alloc(frame_size);
             let mut offset = prelude_size::<AndFramePrelude>();
 
             for idx in 0..num_cells {
                 ptr::write(
-                    (new_ptr as usize + offset) as *mut HeapCellValue,
+                    new_ptr.add(offset) as *mut HeapCellValue,
                     stack_loc_as_cell!(AndFrame, e, idx + 1),
                 );
 
@@ -209,11 +203,15 @@ impl Stack {
         }
     }
 
+    pub(crate) fn top(&self) -> usize {
+        unsafe { (*self.buf.ptr.get()) as usize - self.buf.base as usize }
+    }
+
     pub(crate) fn allocate_or_frame(&mut self, num_cells: usize) -> usize {
         let frame_size = OrFrame::size_of(num_cells);
 
         unsafe {
-            let b = self.buf.ptr as usize - self.buf.base as usize;
+            let b = (*self.buf.ptr.get_mut()) as usize - self.buf.base as usize;
             let new_ptr = self.alloc(frame_size);
             let mut offset = prelude_size::<OrFramePrelude>();
 
@@ -244,7 +242,8 @@ impl Stack {
     #[inline(always)]
     pub(crate) fn index_and_frame_mut(&mut self, e: usize) -> &mut AndFrame {
         unsafe {
-            let ptr = self.buf.base as usize + e;
+            // This is doing alignment wrong
+            let ptr = self.buf.base.add(e);
             &mut *(ptr as *mut AndFrame)
         }
     }
@@ -269,8 +268,8 @@ impl Stack {
     pub(crate) fn truncate(&mut self, b: usize) {
         let base = self.buf.base as usize + b;
 
-        if base < self.buf.ptr as usize {
-            self.buf.ptr = base as *mut _;
+        if base < (*self.buf.ptr.get_mut()) as usize {
+            *self.buf.ptr.get_mut() = base as *mut _;
         }
     }
 }
@@ -282,6 +281,7 @@ mod tests {
     use crate::machine::mock_wam::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn stack_tests() {
         let mut wam = MockWAM::new();
 
@@ -290,7 +290,7 @@ mod tests {
 
         assert_eq!(
             e,
-            0// 10 * mem::size_of::<HeapCellValue>() + prelude_size::<AndFrame>()
+            0 // 10 * mem::size_of::<HeapCellValue>() + prelude_size::<AndFrame>()
         );
 
         assert_eq!(and_frame.prelude.num_cells, 10);
@@ -315,7 +315,10 @@ mod tests {
         let and_frame = wam.machine_st.stack.index_and_frame_mut(next_e);
 
         for idx in 0..9 {
-            assert_eq!(and_frame[idx + 1], stack_loc_as_cell!(AndFrame, next_e, idx + 1));
+            assert_eq!(
+                and_frame[idx + 1],
+                stack_loc_as_cell!(AndFrame, next_e, idx + 1)
+            );
         }
 
         let and_frame = wam.machine_st.stack.index_and_frame(e);

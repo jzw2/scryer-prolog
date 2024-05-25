@@ -56,8 +56,10 @@ impl VarSafetyStatus {
 
 #[derive(Debug, Clone, Copy)]
 pub enum PermVarAllocation {
-    Done { shallow_safety: VarSafetyStatus,
-           deep_safety: VarSafetyStatus },
+    Done {
+        shallow_safety: VarSafetyStatus,
+        deep_safety: VarSafetyStatus,
+    },
     Pending,
 }
 
@@ -72,29 +74,28 @@ impl PermVarAllocation {
 
     #[inline]
     pub(crate) fn pending(&self) -> bool {
-        match self {
-            &PermVarAllocation::Pending => true,
-            _ => false,
-        }
+        matches!(self, &PermVarAllocation::Pending)
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum VarAlloc {
-    Temp { term_loc: GenContext,
-           temp_reg: usize,
-           temp_var_data: TempVarData,
-           safety: VarSafetyStatus,
-           to_perm_var_num: Option<usize> },
+    Temp {
+        term_loc: GenContext,
+        temp_reg: usize,
+        temp_var_data: TempVarData,
+        safety: VarSafetyStatus,
+        to_perm_var_num: Option<usize>,
+    },
     Perm(usize, PermVarAllocation), // stack offset, allocation info
 }
 
 impl VarAlloc {
     #[inline]
     pub(crate) fn as_reg_type(&self) -> RegType {
-        match self {
-            &VarAlloc::Temp { temp_reg, .. } => RegType::Temp(temp_reg),
-            &VarAlloc::Perm(r, _) => RegType::Perm(r),
+        match *self {
+            VarAlloc::Temp { temp_reg, .. } => RegType::Temp(temp_reg),
+            VarAlloc::Perm(r, _) => RegType::Perm(r),
         }
     }
 
@@ -102,7 +103,9 @@ impl VarAlloc {
     pub(crate) fn set_register(&mut self, reg_num: usize) {
         match self {
             VarAlloc::Perm(ref mut p, _) => *p = reg_num,
-            VarAlloc::Temp { ref mut temp_reg, .. } => *temp_reg = reg_num,
+            VarAlloc::Temp {
+                ref mut temp_reg, ..
+            } => *temp_reg = reg_num,
         };
     }
 }
@@ -123,7 +126,7 @@ impl TempVarData {
             }
         }
 
-        return false;
+        false
     }
 
     pub(crate) fn populate_conflict_set(&mut self) {
@@ -191,20 +194,17 @@ impl VariableRecords {
         // Compute the conflict set of u.
 
         // 1.
-        let mut use_sets: IndexMap<usize, IndexSet<(GenContext, usize), FxBuildHasher>> = IndexMap::new();
+        let mut use_sets: IndexMap<usize, IndexSet<(GenContext, usize), FxBuildHasher>> =
+            IndexMap::new();
 
         for (var_gen_index, record) in self.0.iter_mut().enumerate() {
-            match &mut record.allocation {
-                VarAlloc::Temp { temp_var_data, .. } => {
-                    let use_set = std::mem::replace(
-                        &mut temp_var_data.use_set,
-                        IndexSet::with_hasher(FxBuildHasher::default()),
-                    );
+            if let VarAlloc::Temp { temp_var_data, .. } = &mut record.allocation {
+                let use_set = std::mem::replace(
+                    &mut temp_var_data.use_set,
+                    IndexSet::with_hasher(FxBuildHasher::default()),
+                );
 
-                    use_sets.insert(var_gen_index, use_set);
-                }
-                _ => {
-                }
+                use_sets.insert(var_gen_index, use_set);
             }
         }
 
@@ -213,22 +213,25 @@ impl VariableRecords {
             for &(term_loc, reg) in &use_set {
                 if let GenContext::Last(cn_u) = term_loc {
                     for (var_gen_index, record) in self.0.iter_mut().enumerate() {
-                        match &mut record.allocation {
-                            VarAlloc::Temp { term_loc, temp_var_data, .. } => {
-                                if cn_u == term_loc.chunk_num() && u != var_gen_index {
-                                    if !temp_var_data.uses_reg(reg) {
-                                        temp_var_data.no_use_set.insert(reg);
-                                    }
-                                }
+                        if let VarAlloc::Temp {
+                            term_loc,
+                            temp_var_data,
+                            ..
+                        } = &mut record.allocation
+                        {
+                            if cn_u == term_loc.chunk_num()
+                                && u != var_gen_index
+                                && !temp_var_data.uses_reg(reg)
+                            {
+                                temp_var_data.no_use_set.insert(reg);
                             }
-                            _ => {}
                         }
                     }
                 }
             }
 
             // 3.
-            if let VarAlloc::Temp{ temp_var_data, .. } = &mut self[u].allocation {
+            if let VarAlloc::Temp { temp_var_data, .. } = &mut self[u].allocation {
                 temp_var_data.use_set = use_set;
                 temp_var_data.populate_conflict_set();
             }

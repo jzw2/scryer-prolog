@@ -1,6 +1,5 @@
 use crate::arena::*;
 use crate::atom_table::*;
-use crate::types::*;
 use crate::forms::*;
 use crate::heap_iter::*;
 use crate::machine::attributed_variables::*;
@@ -13,7 +12,8 @@ use crate::machine::partial_string::*;
 use crate::machine::stack::*;
 use crate::machine::unify::*;
 use crate::parser::ast::*;
-use crate::parser::rug::{Integer, Rational};
+use crate::parser::dashu::{Integer, Rational};
+use crate::types::*;
 
 use indexmap::IndexSet;
 
@@ -50,7 +50,7 @@ impl MachineState {
             ball: Ball::new(),
             ball_stack: vec![],
             lifted_heap: Heap::new(),
-            interms: vec![Number::default();256],
+            interms: vec![Number::default(); 256],
             cont_pts: Vec::with_capacity(256),
             cwil: CWIL::new(),
             flags: MachineFlags::default(),
@@ -59,8 +59,7 @@ impl MachineState {
             dynamic_mode: FirstOrNext::First,
             unify_fn: MachineState::unify,
             bind_fn: MachineState::bind,
-            run_cleaners_fn: |_| { false },
-            increment_call_count_fn: |_| { Ok(()) },
+            run_cleaners_fn: |_| false,
         }
     }
 
@@ -149,7 +148,7 @@ impl MachineState {
             TrailRef::BlackboardEntry(key_atom) => {
                 self.trail.push(TrailEntry::build_with(
                     TrailEntryTag::TrailedBlackboardEntry,
-                    key_atom.index as u64,
+                    key_atom.index,
                 ));
 
                 self.tr += 1;
@@ -157,12 +156,11 @@ impl MachineState {
             TrailRef::BlackboardOffset(key_atom, value_cell) => {
                 self.trail.push(TrailEntry::build_with(
                     TrailEntryTag::TrailedBlackboardOffset,
-                    key_atom.index as u64,
+                    key_atom.index,
                 ));
 
-                self.trail.push(TrailEntry::from_bytes(
-                    value_cell.into_bytes(),
-                ));
+                self.trail
+                    .push(TrailEntry::from_bytes(value_cell.into_bytes()));
 
                 self.tr += 2;
             }
@@ -248,9 +246,7 @@ impl MachineState {
         r: Ref,
         value: HeapCellValue,
     ) {
-        let mut unifier = CompositeUnifierForOccursCheckWithError::from(
-            DefaultUnifier::from(self),
-        );
+        let mut unifier = CompositeUnifierForOccursCheckWithError::from(DefaultUnifier::from(self));
 
         unifier.bind(r, value);
     }
@@ -297,12 +293,12 @@ impl MachineState {
 
     pub fn unify_big_int(&mut self, n1: TypedArenaPtr<Integer>, value: HeapCellValue) {
         let mut unifier = DefaultUnifier::from(self);
-        unifier.unify_big_num(n1, value);
+        unifier.unify_big_integer(n1, value);
     }
 
     pub fn unify_rational(&mut self, n1: TypedArenaPtr<Rational>, value: HeapCellValue) {
         let mut unifier = DefaultUnifier::from(self);
-        unifier.unify_big_num(n1, value);
+        unifier.unify_big_rational(n1, value);
     }
 
     pub fn unify_f64(&mut self, f1: F64Ptr, value: HeapCellValue) {
@@ -316,9 +312,7 @@ impl MachineState {
     }
 
     pub(super) fn unify_with_occurs_check_with_error(&mut self) {
-        let mut unifier = CompositeUnifierForOccursCheckWithError::from(
-            DefaultUnifier::from(self),
-        );
+        let mut unifier = CompositeUnifierForOccursCheckWithError::from(DefaultUnifier::from(self));
 
         unifier.unify_internal();
     }
@@ -340,7 +334,12 @@ impl MachineState {
         self.ball.boundary = self.heap.len();
 
         copy_term(
-            CopyBallTerm::new(&mut self.stack, &mut self.heap, &mut self.ball.stub),
+            CopyBallTerm::new(
+                &mut self.attr_var_init.attr_var_queue,
+                &mut self.stack,
+                &mut self.heap,
+                &mut self.ball.stub,
+            ),
             addr,
             AttrVarPolicy::DeepCopy,
         );
@@ -380,8 +379,7 @@ impl MachineState {
                     }
                 )
             }
-            &mut HeapPtr::PStrChar(h, ref mut n) |
-            &mut HeapPtr::PStrLocation(h, ref mut n) => {
+            &mut HeapPtr::PStrChar(h, ref mut n) | &mut HeapPtr::PStrLocation(h, ref mut n) => {
                 read_heap_cell!(self.heap[h],
                     (HeapCellValueTag::PStr, pstr_atom) => {
                         let pstr = PartialString::from(pstr_atom);
@@ -438,8 +436,7 @@ impl MachineState {
     pub fn compare_term_test(&mut self, var_comparison: VarComparison) -> Option<Ordering> {
         let mut tabu_list = IndexSet::new();
 
-        while !self.pdl.is_empty() {
-            let s1 = self.pdl.pop().unwrap();
+        while let Some(s1) = self.pdl.pop() {
             let s1 = self.deref(s1);
 
             let s2 = self.pdl.pop().unwrap();
@@ -509,7 +506,7 @@ impl MachineState {
                                     } else {
                                         self.pdl.clear();
                                         return Some(
-                                            n1.chars().next().cmp(&Some(c2))
+                                            n1.as_str().chars().next().cmp(&Some(c2))
                                               .then(Ordering::Greater)
                                         );
                                     }
@@ -539,7 +536,7 @@ impl MachineState {
                                     } else {
                                         self.pdl.clear();
                                         return Some(
-                                            Some(c1).cmp(&n2.chars().next())
+                                            Some(c1).cmp(&n2.as_str().chars().next())
                                                     .then(Ordering::Less)
                                         );
                                     }
@@ -562,7 +559,7 @@ impl MachineState {
                                     } else {
                                         self.pdl.clear();
                                         return Some(
-                                            Some(c1).cmp(&n2.chars().next())
+                                            Some(c1).cmp(&n2.as_str().chars().next())
                                                     .then(Ordering::Less)
                                         );
                                     }
@@ -592,7 +589,7 @@ impl MachineState {
                                     } else {
                                         self.pdl.clear();
                                         return Some(
-                                            n1.chars().next().cmp(&Some(c2))
+                                            n1.as_str().chars().next().cmp(&Some(c2))
                                               .then(Ordering::Greater)
                                         );
                                     }
@@ -639,7 +636,7 @@ impl MachineState {
                                             // iter2 is continuable, so it
                                             // has a tail in the heap at
                                             // focus+1.
-                                            pdl.push(iter2.heap[focus+1]);
+                                            pdl.push(iter2.heap[focus + 1]);
 
                                             return None;
                                         }
@@ -902,8 +899,12 @@ impl MachineState {
 
         let s = string.as_str();
 
-        match heap_pstr_iter.compare_pstr_to_string(s) {
-            Some(PStrPrefixCmpResult { focus, offset, prefix_len }) if prefix_len == s.len() => {
+        match heap_pstr_iter.compare_pstr_to_string(&s) {
+            Some(PStrPrefixCmpResult {
+                focus,
+                offset,
+                prefix_len,
+            }) if prefix_len == s.len() => {
                 let focus_addr = self.heap[focus];
 
                 read_heap_cell!(focus_addr,
@@ -950,7 +951,10 @@ impl MachineState {
 
                 return;
             }
-            Some(PStrPrefixCmpResult { prefix_len: inner_prefix_len, .. }) => {
+            Some(PStrPrefixCmpResult {
+                prefix_len: inner_prefix_len,
+                ..
+            }) => {
                 prefix_len = inner_prefix_len;
             }
             None => {
@@ -1002,9 +1006,9 @@ impl MachineState {
             self.s_offset = 0;
             self.mode = MachineMode::Read;
 
-            put_partial_string(&mut self.heap, pstr, &mut self.atom_tbl)
+            put_partial_string(&mut self.heap, pstr, &self.atom_tbl)
         } else {
-            put_complete_string(&mut self.heap, pstr, &mut self.atom_tbl)
+            put_complete_string(&mut self.heap, pstr, &self.atom_tbl)
         }
     }
 
@@ -1096,7 +1100,7 @@ impl MachineState {
                 (name, 0, 0)
             }
             (HeapCellValueTag::Char, c) => {
-                (self.atom_tbl.build_with(&c.to_string()), 0, 0)
+                (AtomTable::build_with(&self.atom_tbl, &c.to_string()), 0, 0)
             }
             (HeapCellValueTag::Var | HeapCellValueTag::AttrVar | HeapCellValueTag::StackVar) => {
                 let stub = functor_stub(atom!("call"), arity + 1);
@@ -1130,26 +1134,23 @@ impl MachineState {
 
     #[inline]
     pub fn is_cyclic_term(&mut self, value: HeapCellValue) -> bool {
-        if value.is_constant() {
+        let value = self.store(self.deref(value));
+
+        if value.is_stack_var() || value.is_constant() {
             return false;
         }
 
-        let mut iter = stackful_preorder_iter(&mut self.heap, &mut self.stack, value);
+        let h = self.heap.len();
+        self.heap.push(value);
 
-        while let Some(value) = iter.next() {
-            if value.get_forwarding_bit() {
-                let value = unmark_cell_bits!(heap_bound_store(
-                    iter.heap,
-                    heap_bound_deref(iter.heap, value),
-                ));
+        let cycle_found = {
+            let mut iter = cycle_detecting_stackless_preorder_iter(&mut self.heap, h);
+            for _ in iter.by_ref() {}
+            iter.cycle_found()
+        };
 
-                if value.is_compound(iter.heap) {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.heap.pop();
+        cycle_found
     }
 
     // arg(+N, +Term, ?Arg)
@@ -1181,7 +1182,7 @@ impl MachineState {
 
                 let n = match n {
                     Number::Fixnum(n) => n.get_num() as usize,
-                    Number::Integer(n) if *n >= 0 && *n <= std::usize::MAX => n.to_usize().unwrap(),
+                    Number::Integer(n) if usize::try_from(&*n).is_ok() => (&*n).try_into().unwrap(),
                     _ => {
                         self.fail = true;
                         return Ok(());
@@ -1324,7 +1325,7 @@ impl MachineState {
 
         let f_a = if name == atom!(".") && arity == 2 {
             self.heap.push(heap_loc_as_cell!(h));
-            self.heap.push(heap_loc_as_cell!(h+1));
+            self.heap.push(heap_loc_as_cell!(h + 1));
 
             list_loc_as_cell!(h)
         } else {
@@ -1378,14 +1379,14 @@ impl MachineState {
 
                 let mut type_error = |arity| {
                     let err = self.type_error(ValidType::Integer, arity);
-                    return Err(self.error_form(err, stub_gen()));
+                    Err(self.error_form(err, stub_gen()))
                 };
 
                 let arity = match Number::try_from(arity) {
                     Ok(Number::Float(_)) => {
                         return type_error(arity);
                     }
-                    Ok(Number::Rational(n)) if n.denom() != &1 => {
+                    Ok(Number::Rational(n)) if !n.denominator().is_one() => {
                         return type_error(arity);
                     }
                     Ok(n) if n > MAX_ARITY => {
@@ -1398,9 +1399,15 @@ impl MachineState {
                         let err = self.domain_error(DomainErrorType::NotLessThanZero, n);
                         return Err(self.error_form(err, stub_gen()));
                     }
-                    Ok(Number::Rational(n)) => n.numer().to_i64().unwrap(),
+                    Ok(Number::Rational(n)) => {
+                        let value: i64 = n.numerator().try_into().unwrap();
+                        value
+                    },
                     Ok(Number::Fixnum(n)) => n.get_num(),
-                    Ok(Number::Integer(n)) => n.to_i64().unwrap(),
+                    Ok(Number::Integer(n)) => {
+                        let value: i64 = (&*n).try_into().unwrap();
+                        value
+                    },
                     Err(_) => {
                         return type_error(arity);
                     }
@@ -1435,7 +1442,7 @@ impl MachineState {
                         }
                     }
                     (HeapCellValueTag::Char, c) => {
-                        let c = self.atom_tbl.build_with(&c.to_string());
+                        let c = AtomTable::build_with(&self.atom_tbl, &c.to_string());
 
                         self.try_functor_fabricate_struct(
                             c,
@@ -1443,10 +1450,15 @@ impl MachineState {
                             a1.as_var().unwrap(),
                         );
                     }
+                    (HeapCellValueTag::Cons | HeapCellValueTag::Fixnum |
+                     HeapCellValueTag::F64) if arity != 0 => {
+                        let err = self.type_error(ValidType::Atom, store_name);
+                        return Err(self.error_form(err, stub_gen())); // 8.5.1.3 e)
+                    }
                     _ => {
                         let err = self.type_error(ValidType::Atomic, store_name);
-                        return Err(self.error_form(err, stub_gen()));
-                    } // 8.5.1.3 c)
+                        return Err(self.error_form(err, stub_gen())); // 8.5.1.3 c)
+                    }
                 );
             }
             _ => {
@@ -1569,10 +1581,9 @@ impl MachineState {
     ) -> Result<Vec<HeapCellValue>, MachineStub> {
         let mut heap_pstr_iter = HeapPStrIter::new(&self.heap, h);
 
-        while let Some(iteratee) = heap_pstr_iter.next() {
+        for iteratee in heap_pstr_iter.by_ref() {
             match iteratee {
-                PStrIteratee::Char(_, c) =>
-                    chars.push(char_as_cell!(c)),
+                PStrIteratee::Char(_, c) => chars.push(char_as_cell!(c)),
                 PStrIteratee::PStrSegment(_, pstr_atom, n) => {
                     let pstr = PartialString::from(pstr_atom);
                     chars.extend(pstr.as_str_from(n).chars().map(|c| char_as_cell!(c)));
@@ -1614,47 +1625,12 @@ impl MachineState {
 
     // returns true on failure.
     pub fn ground_test(&mut self) -> bool {
-        use fxhash::FxBuildHasher;
+        let iter = eager_stackful_preorder_iter(&mut self.heap, self.registers[1]);
 
-        if self.registers[1].is_constant() {
-            return false;
-        }
-
-        let value = self.store(self.deref(self.registers[1]));
-
-        if value.is_stack_var() {
-            return true;
-        }
-
-        let mut visited = IndexSet::with_hasher(FxBuildHasher::default());
-        let mut iter = stackful_preorder_iter(&mut self.heap, &mut self.stack, value);
-        let mut stack_len = 0;
-
-        while let Some(value) = iter.next() {
-            let mut value = unmark_cell_bits!(value);
-
-            if value.is_var() {
-                value = heap_bound_store(
-                    iter.heap,
-                    heap_bound_deref(iter.heap, value),
-                );
-
-                if value.is_var() {
-                    return true;
-                }
+        for term in iter {
+            if term.is_var() {
+                return true;
             }
-
-            if value.is_compound(iter.heap) {
-                if visited.contains(&value) {
-                    for _ in stack_len .. iter.stack_len() {
-                        iter.pop_stack();
-                    }
-                } else {
-                    visited.insert(value);
-                }
-            }
-
-            stack_len = iter.stack_len();
         }
 
         false
@@ -1676,14 +1652,15 @@ impl MachineState {
                     let addr = self.store(self.deref(addr));
 
                     match Number::try_from(addr) {
-                        Ok(Number::Fixnum(n)) => match u8::try_from(n.get_num()) {
-                            Ok(b) => bytes.push(b),
-                            Err(_) => {}
-                        },
-                        Ok(Number::Integer(n)) => {
-                            if let Some(b) = n.to_u8() {
-                                bytes.push(b);
+                        Ok(Number::Fixnum(n)) => {
+                            if let Ok(b) = u8::try_from(n.get_num()) {
+                                bytes.push(b)
                             }
+                        }
+                        Ok(Number::Integer(n)) => {
+                            let b: u8 = (&*n).try_into().unwrap();
+
+                            bytes.push(b);
                         }
                         _ => {}
                     }

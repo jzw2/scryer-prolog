@@ -1,9 +1,9 @@
 use crate::arena::*;
 use crate::forms::*;
-use crate::heap_iter::stackful_preorder_iter;
-use crate::machine::*;
+use crate::heap_iter::{stackful_preorder_iter, NonListElider};
 use crate::machine::machine_state::*;
 use crate::machine::partial_string::*;
+use crate::machine::*;
 use crate::types::*;
 
 use std::cmp::Ordering;
@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use derive_deref::*;
 use fxhash::FxBuildHasher;
 use indexmap::IndexSet;
+use num_order::NumOrd;
 
 pub(crate) trait Unifier: DerefMut<Target = MachineState> {
     fn unify_structure(&mut self, s1: usize, value: HeapCellValue) {
@@ -172,6 +173,98 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
         let mut pstr_iter1 = HeapPStrIter::new(&machine_st.heap, s1);
         let mut pstr_iter2 = HeapPStrIter::new(&machine_st.heap, s1 + 1);
 
+        fn unify_sequence(
+            machine_st: &mut MachineState,
+            iter: PStrIteratee,
+            source_cell: HeapCellValue,
+        ) -> bool {
+            match iter {
+                PStrIteratee::Char(focus, _) => {
+                    machine_st.pdl.push(machine_st.heap[focus]);
+                    machine_st.pdl.push(source_cell);
+                }
+                PStrIteratee::PStrSegment(focus, _, n) => {
+                    read_heap_cell!(machine_st.heap[focus],
+                        (HeapCellValueTag::CStr | HeapCellValueTag::PStr, pstr_atom) => {
+                            if focus < machine_st.heap.len() - 2 {
+                                machine_st.heap.pop();
+                                machine_st.heap.pop();
+                            }
+
+                            if n == 0 {
+                                let target_cell = match machine_st.heap[focus].get_tag() {
+                                    HeapCellValueTag::CStr => {
+                                        atom_as_cstr_cell!(pstr_atom)
+                                    }
+                                    HeapCellValueTag::PStr => {
+                                        pstr_loc_as_cell!(focus)
+                                    }
+                                    _ => {
+                                        unreachable!()
+                                    }
+                                };
+
+                                machine_st.pdl.push(target_cell);
+                                machine_st.pdl.push(source_cell);
+                            } else {
+                                let h_len = machine_st.heap.len();
+
+                                machine_st.heap.push(pstr_offset_as_cell!(focus));
+                                machine_st.heap.push(fixnum_as_cell!(
+                                    Fixnum::build_with(n as i64)
+                                ));
+
+                                machine_st.pdl.push(pstr_loc_as_cell!(h_len));
+                                machine_st.pdl.push(source_cell);
+                            }
+
+                            return true;
+                        }
+                        (HeapCellValueTag::PStrOffset, pstr_loc) => {
+                            let n0 = cell_as_fixnum!(machine_st.heap[focus+1])
+                                .get_num() as usize;
+
+                            if pstr_loc < machine_st.heap.len() - 2 {
+                                machine_st.heap.pop();
+                                machine_st.heap.pop();
+                            }
+
+                            if n == n0 {
+                                machine_st.pdl.push(pstr_loc_as_cell!(focus));
+                                machine_st.pdl.push(source_cell);
+                            } else {
+                                let h_len = machine_st.heap.len();
+
+                                machine_st.heap.push(pstr_offset_as_cell!(pstr_loc));
+                                machine_st.heap.push(fixnum_as_cell!(
+                                    Fixnum::build_with(n as i64)
+                                ));
+
+                                machine_st.pdl.push(pstr_loc_as_cell!(h_len));
+                                machine_st.pdl.push(source_cell);
+                            }
+
+                            return true;
+                        }
+                        _ => {
+                        }
+                    );
+
+                    if focus < machine_st.heap.len() - 2 {
+                        machine_st.heap.pop();
+                        machine_st.heap.pop();
+                    }
+
+                    machine_st.pdl.push(machine_st.heap[focus]);
+                    machine_st.pdl.push(source_cell);
+
+                    return true;
+                }
+            }
+
+            false
+        }
+
         match compare_pstr_prefixes(&mut pstr_iter1, &mut pstr_iter2) {
             PStrCmpResult::Ordered(Ordering::Equal) => {}
             PStrCmpResult::Ordered(Ordering::Less) => {
@@ -190,8 +283,8 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
                     machine_st.pdl.push(pstr_iter1.focus);
                 }
             }
-            continuable @ PStrCmpResult::FirstIterContinuable(iteratee) |
-            continuable @ PStrCmpResult::SecondIterContinuable(iteratee) => {
+            continuable @ PStrCmpResult::FirstIterContinuable(iteratee)
+            | continuable @ PStrCmpResult::SecondIterContinuable(iteratee) => {
                 if continuable.is_second_iter() {
                     std::mem::swap(&mut pstr_iter1, &mut pstr_iter2);
                 }
@@ -203,7 +296,7 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
 
                 let mut focus = pstr_iter2.focus;
 
-                'outer: loop {
+                'outer: {
                     while let Some(c) = chars_iter.peek() {
                         read_heap_cell!(focus,
                             (HeapCellValueTag::Lis, l) => {
@@ -228,89 +321,13 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
                                     break 'outer;
                                 }
                             }
+                            (HeapCellValueTag::CStr | HeapCellValueTag::PStrLoc) => {
+                                unify_sequence(machine_st, chars_iter.item.unwrap(), focus);
+                                return;
+                            }
                             (HeapCellValueTag::AttrVar | HeapCellValueTag::Var, h) => {
-                                match chars_iter.item.unwrap() {
-                                    PStrIteratee::Char(focus, _) => {
-                                        machine_st.pdl.push(machine_st.heap[focus]);
-                                        machine_st.pdl.push(heap_loc_as_cell!(h));
-                                    }
-                                    PStrIteratee::PStrSegment(focus, _, n) => {
-                                        read_heap_cell!(machine_st.heap[focus],
-                                            (HeapCellValueTag::CStr | HeapCellValueTag::PStr, pstr_atom) => {
-                                                if focus < machine_st.heap.len() - 2 {
-                                                    machine_st.heap.pop();
-                                                    machine_st.heap.pop();
-                                                }
-
-                                                if n == 0 {
-                                                    let target_cell = match machine_st.heap[focus].get_tag() {
-                                                        HeapCellValueTag::CStr => {
-                                                            atom_as_cstr_cell!(pstr_atom)
-                                                        }
-                                                        HeapCellValueTag::PStr => {
-                                                            pstr_loc_as_cell!(focus)
-                                                        }
-                                                        _ => {
-                                                            unreachable!()
-                                                        }
-                                                    };
-
-                                                    machine_st.pdl.push(target_cell);
-                                                    machine_st.pdl.push(heap_loc_as_cell!(h));
-                                                } else {
-                                                    let h_len = machine_st.heap.len();
-
-                                                    machine_st.heap.push(pstr_offset_as_cell!(focus));
-                                                    machine_st.heap.push(fixnum_as_cell!(
-                                                        Fixnum::build_with(n as i64)
-                                                    ));
-
-                                                    machine_st.pdl.push(pstr_loc_as_cell!(h_len));
-                                                    machine_st.pdl.push(heap_loc_as_cell!(h));
-                                                }
-
-                                                return;
-                                            }
-                                            (HeapCellValueTag::PStrOffset, pstr_loc) => {
-                                                let n0 = cell_as_fixnum!(machine_st.heap[focus+1])
-                                                    .get_num() as usize;
-
-                                                if pstr_loc < machine_st.heap.len() - 2 {
-                                                    machine_st.heap.pop();
-                                                    machine_st.heap.pop();
-                                                }
-
-                                                if n == n0 {
-                                                    machine_st.pdl.push(pstr_loc_as_cell!(focus));
-                                                    machine_st.pdl.push(heap_loc_as_cell!(h));
-                                                } else {
-                                                    let h_len = machine_st.heap.len();
-
-                                                    machine_st.heap.push(pstr_offset_as_cell!(pstr_loc));
-                                                    machine_st.heap.push(fixnum_as_cell!(
-                                                        Fixnum::build_with(n as i64)
-                                                    ));
-
-                                                    machine_st.pdl.push(pstr_loc_as_cell!(h_len));
-                                                    machine_st.pdl.push(heap_loc_as_cell!(h));
-                                                }
-
-                                                return;
-                                            }
-                                            _ => {
-                                            }
-                                        );
-
-                                        if focus < machine_st.heap.len() - 2 {
-                                            machine_st.heap.pop();
-                                            machine_st.heap.pop();
-                                        }
-
-                                        machine_st.pdl.push(machine_st.heap[focus]);
-                                        machine_st.pdl.push(heap_loc_as_cell!(h));
-
-                                        return;
-                                    }
+                                if unify_sequence(machine_st, chars_iter.item.unwrap(), heap_loc_as_cell!(h)) {
+                                    return;
                                 }
 
                                 break 'outer;
@@ -328,8 +345,6 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
 
                     machine_st.pdl.push(focus);
                     machine_st.pdl.push(chars_iter.iter.focus);
-
-                    break;
                 }
             }
             PStrCmpResult::Unordered => {
@@ -426,8 +441,8 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
         match Number::try_from(value) {
             Ok(n2) => match n2 {
                 Number::Fixnum(n2) if n1.get_num() == n2.get_num() => {}
-                Number::Integer(n2) if n1.get_num() == *n2 => {}
-                Number::Rational(n2) if n1.get_num() == *n2 => {}
+                Number::Integer(n2) if (*n2).num_eq(&n1.get_num()) => {}
+                Number::Rational(n2) if (*n2).num_eq(&Integer::from(n1.get_num())) => {}
                 _ => {
                     self.fail = true;
                 }
@@ -439,10 +454,8 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
     }
 
     fn unify_big_num<N>(&mut self, n1: TypedArenaPtr<N>, value: HeapCellValue)
-        where N: PartialEq<Rational>
-               + PartialEq<Integer>
-               + PartialEq<i64>
-               + ArenaAllocated
+    where
+        N: PartialEq<Rational> + PartialEq<Integer> + PartialEq<i64> + ArenaAllocated,
     {
         if let Some(r) = value.as_var() {
             Self::bind(self, r, typed_arena_ptr_as_cell!(n1));
@@ -454,6 +467,48 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
                 Number::Fixnum(n2) if *n1 == n2.get_num() => {}
                 Number::Integer(n2) if *n1 == *n2 => {}
                 Number::Rational(n2) if *n1 == *n2 => {}
+                _ => {
+                    self.fail = true;
+                }
+            },
+            Err(_) => {
+                self.fail = true;
+            }
+        }
+    }
+
+    fn unify_big_integer(&mut self, n1: TypedArenaPtr<Integer>, value: HeapCellValue) {
+        if let Some(r) = value.as_var() {
+            Self::bind(self, r, typed_arena_ptr_as_cell!(n1));
+            return;
+        }
+
+        match Number::try_from(value) {
+            Ok(n2) => match n2 {
+                Number::Fixnum(n2) if (*n1).num_eq(&n2.get_num()) => {}
+                Number::Integer(n2) if (*n1).num_eq(&*n2) => {}
+                Number::Rational(n2) if (*n2).num_eq(&*n1) => {}
+                _ => {
+                    self.fail = true;
+                }
+            },
+            Err(_) => {
+                self.fail = true;
+            }
+        }
+    }
+
+    fn unify_big_rational(&mut self, n1: TypedArenaPtr<Rational>, value: HeapCellValue) {
+        if let Some(r) = value.as_var() {
+            Self::bind(self, r, typed_arena_ptr_as_cell!(n1));
+            return;
+        }
+
+        match Number::try_from(value) {
+            Ok(n2) => match n2 {
+                Number::Fixnum(n2) if (*n1).num_eq(&Integer::from(n2.get_num())) => {}
+                Number::Integer(n2) if (*n1).num_eq(&*n2) => {}
+                Number::Rational(n2) if n1 == n2 => {}
                 _ => {
                     self.fail = true;
                 }
@@ -489,10 +544,10 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
 
         match_untyped_arena_ptr!(ptr,
              (ArenaHeaderTag::Integer, int_ptr) => {
-                 Self::unify_big_num(self, int_ptr, value);
+                 Self::unify_big_integer(self, int_ptr, value);
              }
              (ArenaHeaderTag::Rational, rat_ptr) => {
-                 Self::unify_big_num(self, rat_ptr, value);
+                 Self::unify_big_rational(self, rat_ptr, value);
              }
              (ArenaHeaderTag::Stream, stream) => {
                  read_heap_cell!(value,
@@ -568,10 +623,8 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
                         }
                     }
                     (HeapCellValueTag::Lis, l1) => {
-                        if d2.is_ref() {
-                            if tabu_list.contains(&(d1, d2)) {
-                                continue;
-                            }
+                        if d2.is_ref() && tabu_list.contains(&(d1, d2)) {
+                            continue;
                         }
 
                         Self::unify_list(self, l1, d2);
@@ -650,6 +703,9 @@ pub(crate) trait Unifier: DerefMut<Target = MachineState> {
                     (HeapCellValueTag::Cons, ptr_1) => {
                         Self::unify_constant(self, ptr_1, d2);
                     }
+                    (HeapCellValueTag::CutPoint, n1) => {
+                        Self::unify_fixnum(self, n1, d2);
+                    }
                     _ => {
                         unreachable!();
                     }
@@ -676,7 +732,11 @@ fn bind_with_occurs_check<U: Unifier>(unifier: &mut U, r: Ref, value: HeapCellVa
     if !value.is_constant() {
         let machine_st: &mut MachineState = unifier.deref_mut();
 
-        for cell in stackful_preorder_iter(&mut machine_st.heap, &mut machine_st.stack, value) {
+        for cell in stackful_preorder_iter::<NonListElider>(
+            &mut machine_st.heap,
+            &mut machine_st.stack,
+            value,
+        ) {
             let cell = unmark_cell_bits!(cell);
 
             if let Some(inner_r) = cell.as_var() {
@@ -694,7 +754,7 @@ fn bind_with_occurs_check<U: Unifier>(unifier: &mut U, r: Ref, value: HeapCellVa
         U::bind(unifier, r, value);
     }
 
-    return occurs_triggered;
+    occurs_triggered
 }
 
 #[derive(Deref, DerefMut)]

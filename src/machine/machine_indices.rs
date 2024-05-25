@@ -3,15 +3,15 @@ use crate::parser::ast::*;
 use crate::arena::*;
 use crate::atom_table::*;
 use crate::forms::*;
-use crate::machine::ClauseType;
 use crate::machine::loader::*;
 use crate::machine::machine_state::*;
 use crate::machine::streams::Stream;
+use crate::machine::ClauseType;
 
 use fxhash::FxBuildHasher;
 use indexmap::{IndexMap, IndexSet};
-use modular_bitfield::{BitfieldSpecifier, bitfield};
-use modular_bitfield::specifiers::*;
+use scryer_modular_bitfield::specifiers::*;
+use scryer_modular_bitfield::{bitfield, BitfieldSpecifier};
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -20,14 +20,6 @@ use std::ops::{Deref, DerefMut};
 use crate::types::*;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OrderedOpDirKey(pub(crate) Atom, pub(crate) Fixity);
-
-pub(crate) type OssifiedOpDir = IndexMap<(Atom, Fixity), (usize, Specifier)>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DBRef {
-    NamedPred(Atom, usize),
-    Op(Atom, Fixity, TypedArenaPtr<OssifiedOpDir>),
-}
 
 // 7.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,7 +78,8 @@ pub enum IndexPtrTag {
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IndexPtr {
     pub p: B56,
-    #[allow(unused)] m: bool,
+    #[allow(unused)]
+    m: bool,
     pub tag: IndexPtrTag,
 }
 
@@ -125,24 +118,22 @@ impl IndexPtr {
 
     #[inline(always)]
     pub(crate) fn is_undefined(&self) -> bool {
-        match self.tag() {
-            IndexPtrTag::Undefined => true,
-            _ => false,
-        }
+        matches!(self.tag(), IndexPtrTag::Undefined)
     }
 
     #[inline(always)]
     pub(crate) fn is_dynamic_undefined(&self) -> bool {
-        match self.tag() {
-            IndexPtrTag::DynamicUndefined => true,
-            _ => false,
-        }
+        matches!(self.tag(), IndexPtrTag::DynamicUndefined)
     }
 }
 
 #[derive(Debug, Clone, Copy, Ord, Hash, PartialOrd, Eq, PartialEq)]
 pub struct CodeIndex(TypedArenaPtr<IndexPtr>);
 
+#[cfg(target_pointer_width = "32")]
+const_assert!(std::mem::align_of::<CodeIndex>() == 4);
+
+#[cfg(target_pointer_width = "64")]
 const_assert!(std::mem::align_of::<CodeIndex>() == 8);
 
 impl Deref for CodeIndex {
@@ -164,7 +155,7 @@ impl DerefMut for CodeIndex {
 impl From<CodeIndex> for UntypedArenaPtr {
     #[inline(always)]
     fn from(ptr: CodeIndex) -> UntypedArenaPtr {
-        unsafe { std::mem::transmute(ptr.0.as_ptr()) }
+        UntypedArenaPtr::build_with(ptr.0.as_ptr() as usize)
     }
 }
 
@@ -234,6 +225,7 @@ pub enum VarKey {
 }
 
 impl VarKey {
+    #[allow(clippy::inherent_to_string)]
     #[inline]
     pub(crate) fn to_string(&self) -> String {
         match self {
@@ -244,11 +236,7 @@ impl VarKey {
 
     #[inline(always)]
     pub(crate) fn is_anon(&self) -> bool {
-        if let VarKey::AnonVar(_) = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, VarKey::AnonVar(_))
     }
 }
 
@@ -289,7 +277,8 @@ impl IndexStore {
         let (name, arity) = key;
 
         if !ClauseType::is_inbuilt(name, arity) {
-            self.modules.get(&(atom!("builtins")))
+            self.modules
+                .get(&(atom!("builtins")))
                 .map(|module| module.code_dir.contains_key(&(name, arity)))
                 .unwrap_or(false)
         } else {
@@ -298,8 +287,27 @@ impl IndexStore {
     }
 
     #[inline(always)]
-    pub(crate) fn goal_expansion_defined(&self, key: PredicateKey) -> bool {
-        self.goal_expansion_indices.contains(&key)
+    pub(crate) fn goal_expansion_defined(&self, key: PredicateKey, module_name: Atom) -> bool {
+        let compilation_target = match module_name {
+            atom!("user") => CompilationTarget::User,
+            _ => CompilationTarget::Module(module_name),
+        };
+
+        match key {
+            _ if self.goal_expansion_indices.contains(&key) => true,
+            _ => self
+                .get_meta_predicate_spec(key.0, key.1, &compilation_target)
+                .map(|meta_specs| {
+                    meta_specs.iter().find(|meta_spec| {
+                        matches!(
+                            meta_spec,
+                            MetaSpec::Colon | MetaSpec::RequiresExpansionWithArgument(_)
+                        )
+                    })
+                })
+                .map(|meta_spec_opt| meta_spec_opt.is_some())
+                .unwrap_or(false),
+        }
     }
 
     pub(crate) fn get_predicate_skeleton_mut(
@@ -431,20 +439,16 @@ impl IndexStore {
         match compilation_target {
             CompilationTarget::User => self.meta_predicates.get(&(name, arity)),
             CompilationTarget::Module(ref module_name) => match self.modules.get(module_name) {
-                Some(ref module) => module
+                Some(module) => module
                     .meta_predicates
-                    .get(&(name.clone(), arity))
+                    .get(&(name, arity))
                     .or_else(|| self.meta_predicates.get(&(name, arity))),
                 None => self.meta_predicates.get(&(name, arity)),
             },
         }
     }
 
-    pub(crate) fn is_dynamic_predicate(
-        &self,
-        module_name: Atom,
-        key: PredicateKey,
-    ) -> bool {
+    pub(crate) fn is_dynamic_predicate(&self, module_name: Atom, key: PredicateKey) -> bool {
         match module_name {
             atom!("user") => self
                 .extensible_predicates
@@ -452,7 +456,7 @@ impl IndexStore {
                 .map(|skeleton| skeleton.core.is_dynamic)
                 .unwrap_or(false),
             _ => match self.modules.get(&module_name) {
-                Some(ref module) => module
+                Some(module) => module
                     .extensible_predicates
                     .get(&key)
                     .map(|skeleton| skeleton.core.is_dynamic)

@@ -18,6 +18,7 @@ pub trait CopierTarget: IndexMut<usize, Output = HeapCellValue> {
     fn store(&self, value: HeapCellValue) -> HeapCellValue;
     fn deref(&self, value: HeapCellValue) -> HeapCellValue;
     fn push(&mut self, value: HeapCellValue);
+    fn push_attr_var_queue(&mut self, attr_var_loc: usize);
     fn stack(&mut self) -> &mut Stack;
     fn threshold(&self) -> usize;
 }
@@ -73,7 +74,6 @@ impl<T: CopierTarget> CopyTermState<T> {
                     if h >= self.old_h {
                         *self.value_at_scan() = list_loc_as_cell!(h);
                         self.scan += 1;
-
                         return;
                     }
                 }
@@ -91,15 +91,24 @@ impl<T: CopierTarget> CopyTermState<T> {
             self.target.push(hcv);
         }
 
-        let cdr = self.target.store(self.target.deref(heap_loc_as_cell!(addr + 1)));
+        let cdr = self
+            .target
+            .store(self.target.deref(heap_loc_as_cell!(addr + 1)));
 
         if !cdr.is_var() {
+            // mark addr + 1 as a list back edge in the cdr of the list
             self.trail_list_cell(addr + 1, threshold);
+            self.target[addr + 1].set_mark_bit(true);
+            self.target[addr + 1].set_forwarding_bit(true);
         } else {
-            let car = self.target.store(self.target.deref(heap_loc_as_cell!(addr)));
+            let car = self
+                .target
+                .store(self.target.deref(heap_loc_as_cell!(addr)));
 
             if !car.is_var() {
+                // mark addr as a list back edge in the car of the list
                 self.trail_list_cell(addr, threshold);
+                self.target[addr].set_mark_bit(true);
             }
         }
 
@@ -170,10 +179,11 @@ impl<T: CopierTarget> CopyTermState<T> {
 
     fn copy_attr_var_lists(&mut self) {
         while !self.attr_var_list_locs.is_empty() {
-            let iter = mem::replace(&mut self.attr_var_list_locs, vec![]);
+            let iter = std::mem::take(&mut self.attr_var_list_locs);
 
             for (threshold, list_loc) in iter {
                 self.target[threshold] = list_loc_as_cell!(self.target.threshold());
+                self.target.push_attr_var_queue(threshold - 1);
                 self.copy_attr_var_list(list_loc);
             }
         }
@@ -187,11 +197,11 @@ impl<T: CopierTarget> CopyTermState<T> {
     fn copy_attr_var_list(&mut self, mut list_addr: HeapCellValue) {
         while let HeapCellValueTag::Lis = list_addr.get_tag() {
             let threshold = self.target.threshold();
-            let heap_loc = list_addr.get_value();
-            let str_loc  = self.target[heap_loc].get_value();
+            let heap_loc = list_addr.get_value() as usize;
+            let str_loc = self.target[heap_loc].get_value() as usize;
 
-            self.target.push(heap_loc_as_cell!(threshold+2));
-            self.target.push(heap_loc_as_cell!(threshold+1));
+            self.target.push(heap_loc_as_cell!(threshold + 2));
+            self.target.push(heap_loc_as_cell!(threshold + 1));
 
             read_heap_cell!(self.target[str_loc],
                 (HeapCellValueTag::Atom) => {
@@ -259,6 +269,7 @@ impl<T: CopierTarget> CopyTermState<T> {
     }
 
     fn copy_var(&mut self, addr: HeapCellValue) {
+        let index = addr.get_value() as usize;
         let rd = self.target.deref(addr);
         let ra = self.target.store(rd);
 
@@ -267,7 +278,20 @@ impl<T: CopierTarget> CopyTermState<T> {
                 if h >= self.old_h {
                     *self.value_at_scan() = ra;
                     self.scan += 1;
+                    return;
+                }
+            }
+            (HeapCellValueTag::Lis, h) => {
+                if h >= self.old_h && self.target[index].get_mark_bit() {
+                    *self.value_at_scan() = heap_loc_as_cell!(
+                        if ra.get_forwarding_bit() {
+                            h + 1
+                        } else {
+                            h
+                        }
+                    );
 
+                    self.scan += 1;
                     return;
                 }
             }
@@ -352,12 +376,16 @@ impl<T: CopierTarget> CopyTermState<T> {
         }
     }
 
-    fn unwind_trail(&mut self) {
-        for (r, value) in self.trail.drain(0..) {
+    fn unwind_trail(mut self) {
+        for (r, value) in self.trail {
             let index = r.get_value() as usize;
 
             match r.get_tag() {
-                RefTag::AttrVar | RefTag::HeapCell => self.target[index] = value,
+                RefTag::AttrVar | RefTag::HeapCell => {
+                    self.target[index] = value;
+                    self.target[index].set_mark_bit(false);
+                    self.target[index].set_forwarding_bit(false);
+                }
                 RefTag::StackCell => self.target.stack()[index] = value,
             }
         }
@@ -370,6 +398,7 @@ mod tests {
     use crate::machine::mock_wam::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "blocked on atom_table.rs UB")]
     fn copier_tests() {
         let mut wam = MockWAM::new();
 
@@ -377,8 +406,9 @@ mod tests {
         let a_atom = atom!("a");
         let b_atom = atom!("b");
 
-        wam.machine_st.heap
-           .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
+        wam.machine_st
+            .heap
+            .extend(functor!(f_atom, [atom(a_atom), atom(b_atom)]));
 
         assert_eq!(wam.machine_st.heap[0], atom_as_cell!(f_atom, 2));
         assert_eq!(wam.machine_st.heap[1], atom_as_cell!(a_atom));
@@ -401,20 +431,26 @@ mod tests {
 
         wam.machine_st.heap.clear();
 
-        let pstr_var_cell = put_partial_string(&mut wam.machine_st.heap, "abc ", &mut wam.machine_st.atom_tbl);
+        let pstr_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "abc ", &wam.machine_st.atom_tbl);
         let pstr_cell = wam.machine_st.heap[pstr_var_cell.get_value() as usize];
 
         wam.machine_st.heap.pop();
         wam.machine_st.heap.push(pstr_loc_as_cell!(2));
 
-        let pstr_second_var_cell = put_partial_string(&mut wam.machine_st.heap, "def", &mut wam.machine_st.atom_tbl);
+        let pstr_second_var_cell =
+            put_partial_string(&mut wam.machine_st.heap, "def", &wam.machine_st.atom_tbl);
         let pstr_second_cell = wam.machine_st.heap[pstr_second_var_cell.get_value() as usize];
 
         wam.machine_st.heap.pop();
-        wam.machine_st.heap.push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
+        wam.machine_st
+            .heap
+            .push(pstr_loc_as_cell!(wam.machine_st.heap.len() + 1));
 
         wam.machine_st.heap.push(pstr_offset_as_cell!(0));
-        wam.machine_st.heap.push(fixnum_as_cell!(Fixnum::build_with(0i64)));
+        wam.machine_st
+            .heap
+            .push(fixnum_as_cell!(Fixnum::build_with(0i64)));
 
         {
             let wam = TermCopyingMockWAM { wam: &mut wam };
@@ -428,14 +464,20 @@ mod tests {
         assert_eq!(wam.machine_st.heap[2], pstr_second_cell);
         assert_eq!(wam.machine_st.heap[3], pstr_loc_as_cell!(4));
         assert_eq!(wam.machine_st.heap[4], pstr_offset_as_cell!(0));
-        assert_eq!(wam.machine_st.heap[5], fixnum_as_cell!(Fixnum::build_with(0i64)));
+        assert_eq!(
+            wam.machine_st.heap[5],
+            fixnum_as_cell!(Fixnum::build_with(0i64))
+        );
 
         assert_eq!(wam.machine_st.heap[7], pstr_cell);
         assert_eq!(wam.machine_st.heap[8], pstr_loc_as_cell!(9));
         assert_eq!(wam.machine_st.heap[9], pstr_second_cell);
         assert_eq!(wam.machine_st.heap[10], pstr_loc_as_cell!(11));
         assert_eq!(wam.machine_st.heap[11], pstr_offset_as_cell!(7));
-        assert_eq!(wam.machine_st.heap[12], fixnum_as_cell!(Fixnum::build_with(0i64)));
+        assert_eq!(
+            wam.machine_st.heap[12],
+            fixnum_as_cell!(Fixnum::build_with(0i64))
+        );
 
         wam.machine_st.heap.clear();
 

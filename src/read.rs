@@ -10,29 +10,34 @@ use crate::machine::machine_indices::*;
 use crate::machine::machine_state::MachineState;
 use crate::machine::streams::*;
 use crate::parser::char_reader::*;
+#[cfg(feature = "repl")]
 use crate::repl_helper::Helper;
 use crate::types::*;
 
 use fxhash::FxBuildHasher;
 
-use indexmap::IndexSet;
+#[cfg(feature = "repl")]
 use rustyline::error::ReadlineError;
+#[cfg(feature = "repl")]
+use rustyline::history::DefaultHistory;
+#[cfg(feature = "repl")]
 use rustyline::{Config, Editor};
 
 use std::collections::VecDeque;
-use std::io::{Cursor, Error, ErrorKind, Read};
+use std::io::{Cursor, Read};
+#[cfg(feature = "repl")]
+use std::io::{Error, ErrorKind};
+use std::sync::Arc;
 
 type SubtermDeque = VecDeque<(usize, usize)>;
 
-pub(crate) fn devour_whitespace<'a, R: CharRead>(parser: &mut Parser<'a, R>) -> Result<bool, ParserError> {
+pub(crate) fn devour_whitespace<R: CharRead>(
+    parser: &mut Parser<'_, R>,
+) -> Result<bool, ParserError> {
     match parser.lexer.scan_for_layout() {
-        Err(e) if e.is_unexpected_eof() => {
-            Ok(true)
-        }
+        Err(e) if e.is_unexpected_eof() => Ok(true),
         Err(e) => Err(e),
-        Ok(_) => {
-            Ok(false)
-        }
+        Ok(_) => Ok(false),
     }
 }
 
@@ -54,7 +59,6 @@ pub(crate) fn error_after_read_term<R>(
     CompilationError::from(err)
 }
 
-
 impl MachineState {
     pub(crate) fn read(
         &mut self,
@@ -68,20 +72,21 @@ impl MachineState {
 
             parser.add_lines_read(prior_num_lines_read);
 
-            let term = parser.read_term(&op_dir, Tokens::Default)
+            let term = parser
+                .read_term(&op_dir, Tokens::Default)
                 .map_err(|err| error_after_read_term(err, prior_num_lines_read, &parser))?; // CompilationError::from
 
             (term, parser.lines_read() - prior_num_lines_read)
         };
 
         inner.add_lines_read(num_lines_read);
-        write_term_to_heap(&term, &mut self.heap, &mut self.atom_tbl)
+        write_term_to_heap(&term, &mut self.heap, &self.atom_tbl)
     }
 }
 
 static mut PROMPT: bool = false;
-
-const HISTORY_FILE: &'static str = ".scryer_history";
+#[cfg(feature = "repl")]
+const HISTORY_FILE: &str = ".scryer_history";
 
 pub(crate) fn set_prompt(value: bool) {
     unsafe {
@@ -89,6 +94,7 @@ pub(crate) fn set_prompt(value: bool) {
     }
 }
 
+#[cfg(feature = "repl")]
 #[inline]
 fn get_prompt() -> &'static str {
     unsafe {
@@ -102,39 +108,55 @@ fn get_prompt() -> &'static str {
 
 #[derive(Debug)]
 pub struct ReadlineStream {
-    rl: Editor<Helper>,
+    #[cfg(feature = "repl")]
+    rl: Editor<Helper, DefaultHistory>,
     pending_input: CharReader<Cursor<String>>,
+    #[allow(dead_code)]
     add_history: bool,
 }
 
 impl ReadlineStream {
     #[inline]
     pub fn new(pending_input: &str, add_history: bool) -> Self {
-        let config = Config::builder().check_cursor_position(true).build();
-        let helper = Helper::new();
+        #[cfg(feature = "repl")]
+        {
+            let config = Config::builder().check_cursor_position(true).build();
 
-        let mut rl = Editor::with_config(config);
-        rl.set_helper(Some(helper));
+            let helper = Helper::new();
 
-        if let Some(mut path) = dirs_next::home_dir() {
-            path.push(HISTORY_FILE);
-            if path.exists() && rl.load_history(&path).is_err() {
-                println!("Warning: loading history failed");
+            let mut rl = Editor::with_config(config).unwrap();
+            rl.set_helper(Some(helper));
+
+            if let Some(mut path) = dirs_next::home_dir() {
+                path.push(HISTORY_FILE);
+                if path.exists() && rl.load_history(&path).is_err() {
+                    println!("% Warning: loading history failed");
+                }
+            }
+
+            ReadlineStream {
+                rl,
+                pending_input: CharReader::new(Cursor::new(pending_input.to_owned())),
+                add_history,
             }
         }
 
-        // rl.bind_sequence(KeyEvent::from('\t'), Cmd::Insert(1, "\t".to_string()));
-
-        ReadlineStream {
-            rl,
-            pending_input: CharReader::new(Cursor::new(pending_input.to_owned())),
-            add_history: add_history,
+        #[cfg(not(feature = "repl"))]
+        {
+            ReadlineStream {
+                pending_input: CharReader::new(Cursor::new(pending_input.to_owned())),
+                add_history,
+            }
         }
     }
 
-    pub fn set_atoms_for_completion(&mut self, atoms: *const IndexSet<Atom>) {
-        let helper = self.rl.helper_mut().unwrap();
-        helper.atoms = atoms;
+    #[allow(unused_variables)]
+    pub fn set_atoms_for_completion(&mut self, atoms: &Arc<AtomTable>) {
+        #[cfg(feature = "repl")]
+        {
+            let helper = self.rl.helper_mut().unwrap();
+            helper.atoms = Arc::downgrade(atoms);
+        }
     }
 
     #[inline]
@@ -147,6 +169,7 @@ impl ReadlineStream {
         pending_input.set_position(0);
     }
 
+    #[cfg(feature = "repl")]
     fn call_readline(&mut self) -> std::io::Result<usize> {
         match self.rl.readline(get_prompt()) {
             Ok(text) => {
@@ -157,14 +180,16 @@ impl ReadlineStream {
 
                 unsafe {
                     if PROMPT {
-                        self.rl.history_mut().add(self.pending_input.get_ref().get_ref());
+                        self.rl
+                            .add_history_entry(self.pending_input.get_ref().get_ref())
+                            .unwrap();
                         self.save_history();
                         PROMPT = false;
                     }
-                }
 
-                if self.pending_input.get_ref().get_ref().chars().last() != Some('\n') {
-                    *self.pending_input.get_mut().get_mut() += "\n";
+                    if !self.pending_input.get_ref().get_ref().ends_with('\n') {
+                        *self.pending_input.get_mut().get_mut() += "\n";
+                    }
                 }
 
                 Ok(self.pending_input.get_ref().get_ref().len())
@@ -174,6 +199,12 @@ impl ReadlineStream {
         }
     }
 
+    #[cfg(not(feature = "repl"))]
+    fn call_readline(&mut self) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    #[cfg(feature = "repl")]
     fn save_history(&mut self) {
         if !self.add_history {
             return;
@@ -182,13 +213,17 @@ impl ReadlineStream {
             path.push(HISTORY_FILE);
             if path.exists() {
                 if self.rl.append_history(&path).is_err() {
-                    println!("Warning: couldn't append history (existing file)");
+                    println!("% Warning: couldn't append history (existing file)");
                 }
             } else if self.rl.save_history(&path).is_err() {
-                println!("Warning: couldn't save history (new file)");
+                println!("% Warning: couldn't save history (new file)");
             }
         }
     }
+
+    #[allow(dead_code)]
+    #[cfg(not(feature = "repl"))]
+    fn save_history(&mut self) {}
 
     #[inline]
     pub(crate) fn peek_byte(&mut self) -> std::io::Result<u8> {
@@ -220,7 +255,7 @@ impl Read for ReadlineStream {
                 self.call_readline()?;
                 self.pending_input.read(buf)
             }
-            result => result
+            result => result,
         }
     }
 }
@@ -233,16 +268,14 @@ impl CharRead for ReadlineStream {
                 Some(Ok(c)) => {
                     return Some(Ok(c));
                 }
-                _ => {
-                    match self.call_readline() {
-                        Err(e) => {
-                            return Some(Err(e));
-                        }
-                        _ => {
-                            set_prompt(false);
-                        }
+                _ => match self.call_readline() {
+                    Err(e) => {
+                        return Some(Err(e));
                     }
-                }
+                    _ => {
+                        set_prompt(false);
+                    }
+                },
             }
         }
     }
@@ -259,10 +292,10 @@ impl CharRead for ReadlineStream {
 }
 
 #[inline]
-pub(crate) fn write_term_to_heap<'a, 'b>(
-    term: &'a Term,
-    heap: &'b mut Heap,
-    atom_tbl: &mut AtomTable,
+pub(crate) fn write_term_to_heap(
+    term: &Term,
+    heap: &mut Heap,
+    atom_tbl: &AtomTable,
 ) -> Result<TermWriteResult, CompilationError> {
     let term_writer = TermWriter::new(heap, atom_tbl);
     term_writer.write_term_to_heap(term)
@@ -271,7 +304,7 @@ pub(crate) fn write_term_to_heap<'a, 'b>(
 #[derive(Debug)]
 struct TermWriter<'a, 'b> {
     heap: &'a mut Heap,
-    atom_tbl: &'b mut AtomTable,
+    atom_tbl: &'b AtomTable,
     queue: SubtermDeque,
     var_dict: HeapVarDict,
 }
@@ -284,7 +317,7 @@ pub struct TermWriteResult {
 
 impl<'a, 'b> TermWriter<'a, 'b> {
     #[inline]
-    fn new(heap: &'a mut Heap, atom_tbl: &'b mut AtomTable) -> Self {
+    fn new(heap: &'a mut Heap, atom_tbl: &'b AtomTable) -> Self {
         TermWriter {
             heap,
             atom_tbl,
@@ -314,17 +347,18 @@ impl<'a, 'b> TermWriter<'a, 'b> {
         match term {
             &TermRef::Cons(..) => list_loc_as_cell!(h),
             &TermRef::AnonVar(_) | &TermRef::Var(..) => heap_loc_as_cell!(h),
-            &TermRef::CompleteString(_, _, ref src) =>
+            TermRef::CompleteString(_, _, src) => {
                 if src.as_str().is_empty() {
                     empty_list_as_cell!()
                 } else if self.heap[h].get_tag() == HeapCellValueTag::CStr {
                     heap_loc_as_cell!(h)
                 } else {
                     pstr_loc_as_cell!(h)
-                },
+                }
+            }
             &TermRef::PartialString(..) => pstr_loc_as_cell!(h),
             &TermRef::Literal(_, _, literal) => HeapCellValue::from(*literal),
-            &TermRef::Clause(_,_,_,subterms) if subterms.len() == 0 => heap_loc_as_cell!(h),
+            &TermRef::Clause(_, _, _, subterms) if subterms.is_empty() => heap_loc_as_cell!(h),
             &TermRef::Clause(..) => str_loc_as_cell!(h),
         }
     }
@@ -356,7 +390,7 @@ impl<'a, 'b> TermWriter<'a, 'b> {
                         return Err(CompilationError::ExceededMaxArity);
                     }
 
-                    self.heap.push(if subterms.len() == 0 {
+                    self.heap.push(if subterms.is_empty() {
                         heap_loc_as_cell!(heap_loc + 1)
                     } else {
                         str_loc_as_cell!(heap_loc + 1)
@@ -394,7 +428,8 @@ impl<'a, 'b> TermWriter<'a, 'b> {
                 }
                 &TermRef::AnonVar(_) => {
                     if let Some((arity, site_h)) = self.queue.pop_front() {
-                        self.var_dict.insert(VarKey::AnonVar(h), heap_loc_as_cell!(site_h));
+                        self.var_dict
+                            .insert(VarKey::AnonVar(h), heap_loc_as_cell!(site_h));
 
                         if arity > 1 {
                             self.queue.push_front((arity - 1, site_h + 1));
@@ -403,10 +438,11 @@ impl<'a, 'b> TermWriter<'a, 'b> {
 
                     continue;
                 }
-                &TermRef::CompleteString(_, _, ref src) => {
-                    put_complete_string(self.heap, src.as_str(), self.atom_tbl);
+                TermRef::CompleteString(_, _, src) => {
+                    let src = src.as_str().to_owned();
+                    put_complete_string(self.heap, &src, self.atom_tbl);
                 }
-                &TermRef::PartialString(lvl, _, ref src, _) => {
+                &TermRef::PartialString(lvl, _, src, _) => {
                     if let Level::Root = lvl {
                         // Var tags can't refer directly to partial strings,
                         // so a PStrLoc cell must be pushed.
@@ -422,7 +458,7 @@ impl<'a, 'b> TermWriter<'a, 'b> {
                         continue;
                     }
                 }
-                &TermRef::Var(.., ref var) => {
+                TermRef::Var(.., var) => {
                     if let Some((arity, site_h)) = self.queue.pop_front() {
                         let var_key = VarKey::VarPtr(var.clone());
 

@@ -124,7 +124,7 @@ call(_, _, _, _, _, _, _, _, _).
 % while others can be set with `set_prolog_flag/2`.
 %
 % The flags that Scryer Prolog support are:
-% 
+%
 %  * `max_arity`: The max arity a predicate can have in Prolog. On Scryer is set to 1023. Read only.
 %  * `bounded`: `true` if integer arithmethic is bounded between some min/max values. On Scryer is always set
 %    to `false` since it supports unbounded integer arithmethic. Read only.
@@ -143,6 +143,7 @@ call(_, _, _, _, _, _, _, _, _).
 %    enabled) and `error` which throws an exception when a cylic term is created. Read and write.
 %  * `unknown`: How undefined predicates are handled when called. Possible values are `error` (the default, an error is thrown),
 %    `fail` (the call silently fails) and `warn` (the call fails and a warning about the undefined predicate is printed).
+%  * `answer_write_options`: Additional write options used by the top level for writing answers.
 %
 current_prolog_flag(Flag, Value) :- Flag == max_arity, !, Value = 1023.
 current_prolog_flag(max_arity, 1023).
@@ -160,6 +161,14 @@ current_prolog_flag(Flag, OccursCheckEnabled) :-
     Flag == occurs_check,
     !,
     '$is_sto_enabled'(OccursCheckEnabled).
+current_prolog_flag(occurs_check, OccursCheckEnabled) :-
+    '$is_sto_enabled'(OccursCheckEnabled).
+current_prolog_flag(Flag, Value) :-
+    Flag == answer_write_options,
+    !,
+    answer_write_options(Value).
+current_prolog_flag(answer_write_options, Value) :-
+    answer_write_options(Value).
 current_prolog_flag(Flag, _) :-
     atom(Flag),
     throw(error(domain_error(prolog_flag, Flag), current_prolog_flag/2)). % 8.17.2.3 b
@@ -167,10 +176,15 @@ current_prolog_flag(Flag, _) :-
     nonvar(Flag),
     throw(error(type_error(atom, Flag), current_prolog_flag/2)). % 8.17.2.3 a
 
+answer_write_options(Value) :-
+    (   iso_ext:bb_get('$answer_write_options', Value) -> true
+    ;   Value = []
+    ).
+
 %% set_prolog_flag(Flag, Value).
 %
 % Sets the internal value of the flag. To see the list of flags supported by Scryer Prolog,
-% check `current_prolog_flag/2`. The flags that are read only will fail if you try to change their values 
+% check `current_prolog_flag/2`. The flags that are read only will fail if you try to change their values
 set_prolog_flag(Flag, Value) :-
     (var(Flag) ; var(Value)),
     throw(error(instantiation_error, set_prolog_flag/2)). % 8.17.1.3 a, b
@@ -207,13 +221,24 @@ set_prolog_flag(occurs_check, false) :-
 set_prolog_flag(occurs_check, error) :-
     !, '$set_sto_with_error_as_unify'.
 set_prolog_flag(double_quotes, Value) :-
-    throw(error(domain_error(flag_value, double_quotes + Value),
-                set_prolog_flag/2)). % 8.17.1.3 e
+    flag_domain_error(double_quotes, Value).
+set_prolog_flag(answer_write_options, Options) :-
+    !,
+    catch(catch(builtins:parse_write_options(Options, _, set_prolog_flag/2),
+                error(domain_error(_,_), _),
+                throw(error(type_error(_,_), _))), % convert domain error to type error ....
+          error(type_error(_,_), _),               % ... to catch type and domain errors.
+          flag_domain_error(answer_write_options, Options)),
+    iso_ext:bb_put('$answer_write_options', Options).
 set_prolog_flag(Flag, _) :-
     atom(Flag),
     throw(error(domain_error(prolog_flag, Flag), set_prolog_flag/2)). % 8.17.1.3 d
 set_prolog_flag(Flag, _) :-
     throw(error(type_error(atom, Flag), set_prolog_flag/2)). % 8.17.1.3 c
+
+flag_domain_error(Flag, Value) :-
+    % domain error via 8.17.1.3 e: Value is inappropriate for Flag
+    throw(error(domain_error(flag_value, Flag + Value), set_prolog_flag/2)).
 
 % control operators.
 
@@ -262,6 +287,9 @@ repeat :- repeat.
 %% ->(G1, G2)
 %
 % If-then and if-then-else constructs
+
+:- non_counted_backtracking (->)/2.
+
 G1 -> G2 :- control_entry_point((G1 -> G2)).
 
 
@@ -275,6 +303,9 @@ staggered_if_then(G1, G2) :-
 %% ;(G1, G2)
 %
 % Disjunction (or)
+
+:- non_counted_backtracking (;)/2.
+
 G1 ; G2 :- control_entry_point((G1 ; G2)).
 
 
@@ -297,6 +328,9 @@ staggered_sc(_, G) :- call(G).
 % to reason about the programs. Also restricts the ability to run the program with alternative execution strategies
 !.
 
+:- non_counted_backtracking get_cp/1.
+get_cp(B) :- '$get_cp'(B).
+
 :- non_counted_backtracking set_cp/1.
 
 set_cp(B) :- '$set_cp'(B).
@@ -304,6 +338,9 @@ set_cp(B) :- '$set_cp'(B).
 %% ,(G1, G2)
 %
 % Conjuction (and)
+
+:- non_counted_backtracking (',')/2.
+
 ','(G1, G2) :- control_entry_point((G1, G2)).
 
 
@@ -325,21 +362,21 @@ cont_list_goal(Conts, '$call'(builtins:dispatch_call_list(Conts))).
 
 :- non_counted_backtracking dispatch_prep/3.
 
-dispatch_prep(Gs, B, [Cont|Conts]) :-
+dispatch_prep(Gs, B, Conts) :-
     (  callable(Gs) ->
        strip_module(Gs, M, Gs0),
        (  nonvar(Gs0),
-          dispatch_prep_(Gs0, B, [Cont|Conts]) ->
+          dispatch_prep_(Gs0, B, Conts) ->
           true
        ;  Gs0 == ! ->
-          Cont = '$call'(builtins:set_cp(B)),
-          Conts = []
-       ;  Cont = Gs,
-          Conts = []
+          Conts = ['$call'(builtins:set_cp(B))]
+       ;  nonvar(Gs0),
+          \+ callable(Gs0) ->
+          throw(dispatch_prep_error)
+       ;  Conts = [Gs]
        )
     ;  var(Gs) ->
-       Cont = Gs,
-       Conts = []
+       Conts = [Gs]
     ;  throw(dispatch_prep_error)
     ).
 
@@ -350,20 +387,32 @@ dispatch_prep_((G1, G2), B, [Cont|Conts]) :-
     dispatch_prep(G1, B, IConts1),
     cont_list_goal(IConts1, Cont),
     dispatch_prep(G2, B, Conts).
-dispatch_prep_((G1 ; G2), B, [Cont|Conts]) :-
-    dispatch_prep(G1, B, IConts0),
+dispatch_prep_((G1 ; G2), B, Conts) :-
+    (  nonvar(G1) ->
+       (  G1 = (G11 -> G12) ->
+          dispatch_prep(G11, B, IConts2),
+          dispatch_prep(G12, B, IConts3),
+          cont_list_goal(IConts2, Cont2),
+          cont_list_goal(IConts3, Cont3),
+          Cont0 = '$call'(builtins:staggered_if_then(Cont2, Cont3))
+       ;  dispatch_prep(G1, B, IConts0),
+          dispatch_prep(G2, B, IConts1),
+          cont_list_goal(IConts0, Cont0)
+       )
+    ;  dispatch_prep(G1, B1, IConts0),
+       cont_list_goal(IConts0, Cont0)
+    ),
     dispatch_prep(G2, B, IConts1),
     cont_list_goal(IConts0, Cont0),
     cont_list_goal(IConts1, Cont1),
-    Cont = '$call'(builtins:staggered_sc(Cont0, Cont1)),
-    Conts = [].
-dispatch_prep_((G1 -> G2), B, [Cont|Conts]) :-
-    dispatch_prep(G1, B, IConts1),
+    Conts = ['$call'(builtins:staggered_sc(Cont0, Cont1))].
+dispatch_prep_((G1 -> G2), B, Conts) :-
+    dispatch_prep(G1, B1, IConts1),
     dispatch_prep(G2, B, IConts2),
     cont_list_goal(IConts1, Cont1),
     cont_list_goal(IConts2, Cont2),
-    Cont = '$call'(builtins:staggered_if_then(Cont1, Cont2)),
-    Conts = [].
+    Conts = ['$call'(builtins:get_cp(B1)),
+             '$call'(builtins:staggered_if_then(Cont1, Cont2))].
 
 
 :- non_counted_backtracking dispatch_call_list/1.
@@ -537,26 +586,30 @@ parse_write_options(Options, OptionValues, Stub) :-
 
 
 parse_write_options_(double_quotes(DoubleQuotes), double_quotes-DoubleQuotes) :-
-    (  nonvar(DoubleQuotes),
-       lists:member(DoubleQuotes, [true, false]),
+    (  var(DoubleQuotes) ->
+       throw(error(instantiation_error, _))
+    ;  lists:member(DoubleQuotes, [true, false]),
        !
     ;  throw(error(domain_error(write_option, double_quotes(DoubleQuotes)), _))
     ).
 parse_write_options_(ignore_ops(IgnoreOps), ignore_ops-IgnoreOps) :-
-    (  nonvar(IgnoreOps),
-       lists:member(IgnoreOps, [true, false]),
+    (  var(IgnoreOps) ->
+       throw(error(instantiation_error, _))
+    ;  lists:member(IgnoreOps, [true, false]),
        !
     ;  throw(error(domain_error(write_option, ignore_ops(IgnoreOps)), _))
     ).
 parse_write_options_(quoted(Quoted), quoted-Quoted) :-
-    (  nonvar(Quoted),
-       lists:member(Quoted, [true, false]),
+    (  var(Quoted) ->
+       throw(error(instantiation_error, _))
+    ;  lists:member(Quoted, [true, false]),
        !
     ;  throw(error(domain_error(write_option, quoted(Quoted)), _))
     ).
 parse_write_options_(numbervars(NumberVars), numbervars-NumberVars) :-
-    (  nonvar(NumberVars),
-       lists:member(NumberVars, [true, false]),
+    (  var(NumberVars) ->
+       throw(error(instantiation_error, _))
+    ;  lists:member(NumberVars, [true, false]),
        !
     ;  throw(error(domain_error(write_option, numbervars(NumberVars)), _))
     ).
@@ -564,7 +617,9 @@ parse_write_options_(variable_names(VNNames), variable_names-VNNames) :-
     must_be_var_names_list(VNNames),
     !.
 parse_write_options_(max_depth(MaxDepth), max_depth-MaxDepth) :-
-    (  integer(MaxDepth),
+    (  var(MaxDepth) ->
+       throw(error(instantiation_error, _))
+    ;  integer(MaxDepth),
        MaxDepth >= 0,
        !
     ;  throw(error(domain_error(write_option, max_depth(MaxDepth)), _))
@@ -678,30 +733,9 @@ parse_read_term_options(Options, OptionValues, Stub) :-
     parse_options_list(Options, builtins:parse_read_term_options_, DefaultOptions, OptionValues, Stub).
 
 
-parse_read_term_options_(singletons(Vars), singletons-Vars) :-
-    (  ( var(Vars)
-       ; '$skip_max_list'(_, _, Vars, Rs),
-         Rs == []
-       ) ->
-       !
-    ;  throw(error(domain_error(read_option, singletons(Vars)), read_term/2))
-    ).
-parse_read_term_options_(variables(Vars), variables-Vars) :-
-    (  ( var(Vars)
-       ; '$skip_max_list'(_, _, Vars, Rs),
-         Rs == []
-       ) ->
-       !
-    ;  throw(error(domain_error(read_option, variables(Vars)), read_term/2))
-    ).
-parse_read_term_options_(variable_names(Vars), variable_names-Vars) :-
-    (  ( var(Vars)
-       ; '$skip_max_list'(_, _, Vars, Rs),
-         Rs == []
-       ) ->
-       !
-    ;  throw(error(domain_error(read_option, variable_names(Vars)), read_term/2))
-    ).
+parse_read_term_options_(singletons(Vars), singletons-Vars) :- !.
+parse_read_term_options_(variables(Vars), variables-Vars) :- !.
+parse_read_term_options_(variable_names(Vars), variable_names-Vars) :- !.
 parse_read_term_options_(E,_) :-
     throw(error(domain_error(read_option, E), _)).
 
@@ -711,7 +745,7 @@ parse_read_term_options_(E,_) :-
 % Read Term from the stream Stream. It supports several options:
 %  * `variables(-Vars)` unifies Vars with a list of variables in the term. Similar to do `term_variables/2` with the new term.
 %  * `variable_names(-Vars)` unifies Vars with a list `Name=Var` with Name describing the variable name and Var the variable itself that appears in Term.
-%  * `singletons` similar to `variable_names` but only reports variables occurring only once in Term. 
+%  * `singletons` similar to `variable_names` but only reports variables occurring only once in Term.
 read_term(Stream, Term, Options) :-
     parse_read_term_options(Options, [Singletons, VariableNames, Variables], read_term/3),
     '$read_term'(Stream, Term, Singletons, Variables, VariableNames).
@@ -785,7 +819,7 @@ catch(G,C,R) :-
 
 catch(G,C,R,Bb) :-
     '$install_new_block'(NBb),
-    '$call_with_inference_counting'(call(G)),
+    call(G),
     end_block(Bb, NBb).
 catch(G,C,R,Bb) :-
     '$reset_block'(Bb),
@@ -1139,8 +1173,13 @@ clause(H, B) :-
 % The clause will be inserted at the beginning of the module.
 asserta(Clause0) :-
     loader:strip_subst_module(Clause0, user, Module, Clause),
-    iso_ext:asserta(Module, Clause).
+    asserta_(Module, Clause).
 
+asserta_(Module, (Head :- Body)) :-
+    !,
+    '$asserta'(Module, Head, Body).
+asserta_(Module, Fact) :-
+    '$asserta'(Module, Fact, true).
 
 :- meta_predicate assertz(:).
 
@@ -1150,7 +1189,13 @@ asserta(Clause0) :-
 % The clase will be inserted at the end of the module.
 assertz(Clause0) :-
     loader:strip_subst_module(Clause0, user, Module, Clause),
-    iso_ext:assertz(Module, Clause).
+    assertz_(Module, Clause).
+
+assertz_(Module, (Head :- Body)) :-
+    !,
+    '$assertz'(Module, Head, Body).
+assertz_(Module, Fact) :-
+    '$assertz'(Module, Fact, true).
 
 
 :- meta_predicate retract(:).
@@ -1169,6 +1214,9 @@ retract(Clause0) :-
        Body = true,
        retract_module_clause(Head, Body, Module)
     ;  Clause = (Head :- Body) ->
+       (  var(Module) -> Module = user
+       ;  true
+       ),
        retract_module_clause(Head, Body, Module)
     ).
 
@@ -1191,7 +1239,10 @@ call_retract_helper(Head, Body, P, Module) :-
     ;  ClauseQualifier = Module
     ),
     ClauseQualifier:'$clause'(Head, Body),
-    '$get_clause_p'(Head, P, Module).
+    % ensure '$get_clause_p'/3 is not the last clause so it can
+    % recover the choice point of '$clause' if necessary.
+    '$get_clause_p'(Head, P, Module),
+    true.
 
 call_retract(Head, Body, Name, Arity, Module) :-
     findall(P, builtins:call_retract_helper(Head, Body, P, Module), Ps),
@@ -1339,11 +1390,6 @@ current_predicate(Pred) :-
     ;  throw(error(type_error(predicate_indicator, Pred), current_predicate/1))
     ).
 
-'$iterate_op_db_refs'(RPriority, RSpec, ROp, _, RPriority, RSpec, ROp).
-'$iterate_op_db_refs'(RPriority, RSpec, ROp, OssifiedOpDir, Priority, Spec, Op) :-
-    '$get_next_op_db_ref'(RPriority, RSpec, ROp, OssifiedOpDir, RRPriority, RRSpec, RROp),
-    '$iterate_op_db_refs'(RRPriority, RRSpec, RROp, OssifiedOpDir, Priority, Spec, Op).
-
 can_be_op_priority(Priority) :- var(Priority).
 can_be_op_priority(Priority) :- op_priority(Priority).
 
@@ -1359,8 +1405,8 @@ current_op(Priority, Spec, Op) :-
     (  can_be_op_priority(Priority),
        can_be_op_specifier(Spec),
        error:can_be(atom, Op) ->
-       '$get_next_op_db_ref'(RPriority, RSpec, ROp, OssifiedOpDir, _, _, Op),
-       '$iterate_op_db_refs'(RPriority, RSpec, ROp, OssifiedOpDir, Priority, Spec, Op)
+       '$get_next_op_db_ref'(Priority, Spec, Op, ListOfOps),
+       lists:member(op(Priority, Spec, Op), ListOfOps)
     ).
 
 list_of_op_atoms(Var) :-
@@ -1584,7 +1630,7 @@ atom_concat(Atom_1, Atom_2, Atom_12) :-
 %% sub_atom(+Atom, ?Before, ?Length, ?After, ?SubAtom).
 %
 % Relates an atom to a subatom inside with some key properties:
-% 
+%
 %  * SubAtom starts at Before characters (0-based) from Atom
 %  * SubAtom has Length characters
 %  * After SubAtom there are After characters in Atom
@@ -2183,6 +2229,9 @@ set_stream_position(S_or_a, Position) :-
 %% callable(X).
 %
 % True iff X is bound o an atom or a compund term.
+
+:- non_counted_backtracking callable/1.
+
 callable(X) :-
     (  nonvar(X), functor(X, F, _), atom(F) ->
        true
@@ -2206,4 +2255,7 @@ nl(Stream) :-
 %
 % Throws an exception of the following structure: `error(ErrorTerm, ImpDef)`.
 error(Error_term, Imp_def) :-
-   throw(error(Error_term, Imp_def)).
+    (  var(Error_term) ->
+       throw(error(instantiation_error, error/2))
+    ;  throw(error(Error_term, Imp_def))
+    ).

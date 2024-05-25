@@ -10,14 +10,15 @@ use std::hash::{Hash, Hasher};
 use std::io::{Error as IOError, ErrorKind};
 use std::ops::{Deref, Neg};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::vec::Vec;
 
-use crate::parser::rug::{Integer, Rational};
+use crate::parser::dashu::{Integer, Rational};
 
 use fxhash::FxBuildHasher;
 use indexmap::IndexMap;
-use modular_bitfield::error::OutOfBounds;
-use modular_bitfield::prelude::*;
+use scryer_modular_bitfield::error::OutOfBounds;
+use scryer_modular_bitfield::prelude::*;
 
 pub type Specifier = u32;
 
@@ -33,6 +34,7 @@ pub const FY: u32 = 0x0080;
 pub const DELIMITER: u32 = 0x0100;
 pub const TERM: u32 = 0x1000;
 pub const LTERM: u32 = 0x3000;
+pub const BTERM: u32 = 0x11000;
 
 pub const NEGATIVE_SIGN: u32 = 0x0200;
 
@@ -47,13 +49,13 @@ macro_rules! fixnum {
 
 macro_rules! is_term {
     ($x:expr) => {
-        ($x as u32 & $crate::parser::ast::TERM) != 0
+        ($x as u32 & $crate::parser::ast::TERM) != 0 || is_negate!($x)
     };
 }
 
 macro_rules! is_lterm {
     ($x:expr) => {
-        ($x as u32 & $crate::parser::ast::LTERM) != 0
+        ($x as u32 & $crate::parser::ast::LTERM) != 0 || is_negate!($x)
     };
 }
 
@@ -245,11 +247,7 @@ impl GenContext {
 
     #[inline]
     pub fn is_last(self) -> bool {
-        if let GenContext::Last(_) = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, GenContext::Last(_))
     }
 }
 
@@ -258,7 +256,8 @@ impl GenContext {
 pub struct OpDesc {
     prec: B11,
     spec: B8,
-    #[allow(unused)] padding: B13,
+    #[allow(unused)]
+    padding: B13,
 }
 
 impl OpDesc {
@@ -300,24 +299,16 @@ impl OpDesc {
 // name and fixity -> operator type and precedence.
 pub type OpDir = IndexMap<(Atom, Fixity), OpDesc, FxBuildHasher>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct MachineFlags {
     pub double_quotes: DoubleQuotes,
     pub unknown: Unknown,
 }
 
-impl Default for MachineFlags {
-    fn default() -> Self {
-        MachineFlags {
-            double_quotes: DoubleQuotes::default(),
-            unknown: Unknown::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum DoubleQuotes {
     Atom,
+    #[default]
     Chars,
     Codes,
 }
@@ -336,14 +327,9 @@ impl DoubleQuotes {
     }
 }
 
-impl Default for DoubleQuotes {
-    fn default() -> Self {
-        DoubleQuotes::Chars
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum Unknown {
+    #[default]
     Error,
     Fail,
     Warn,
@@ -360,13 +346,6 @@ impl Unknown {
 
     pub fn is_warn(self) -> bool {
         matches!(self, Unknown::Warn)
-    }
-}
-
-impl Default for Unknown {
-    #[inline]
-    fn default() -> Self {
-        Unknown::Error
     }
 }
 
@@ -417,13 +396,13 @@ pub enum ParserError {
 impl ParserError {
     pub fn line_and_col_num(&self) -> Option<(usize, usize)> {
         match self {
-            &ParserError::BackQuotedString(line_num, col_num) |
-            &ParserError::IncompleteReduction(line_num, col_num) |
-            &ParserError::MissingQuote(line_num, col_num) |
-            &ParserError::NonPrologChar(line_num, col_num) |
-            &ParserError::ParseBigInt(line_num, col_num) |
-            &ParserError::UnexpectedChar(_, line_num, col_num) |
-            &ParserError::Utf8Error(line_num, col_num) => Some((line_num, col_num)),
+            &ParserError::BackQuotedString(line_num, col_num)
+            | &ParserError::IncompleteReduction(line_num, col_num)
+            | &ParserError::MissingQuote(line_num, col_num)
+            | &ParserError::NonPrologChar(line_num, col_num)
+            | &ParserError::ParseBigInt(line_num, col_num)
+            | &ParserError::UnexpectedChar(_, line_num, col_num)
+            | &ParserError::Utf8Error(line_num, col_num) => Some((line_num, col_num)),
             _ => None,
         }
     }
@@ -432,8 +411,15 @@ impl ParserError {
         match self {
             ParserError::BackQuotedString(..) => atom!("back_quoted_string"),
             ParserError::IncompleteReduction(..) => atom!("incomplete_reduction"),
-            ParserError::InvalidSingleQuotedCharacter(..) => atom!("invalid_single_quoted_character"),
-            ParserError::IO(e) if e.kind() == ErrorKind::UnexpectedEof => atom!("unexpected_end_of_file"),
+            ParserError::InvalidSingleQuotedCharacter(..) => {
+                atom!("invalid_single_quoted_character")
+            }
+            ParserError::IO(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                atom!("unexpected_end_of_file")
+            }
+            ParserError::IO(e) if e.kind() == ErrorKind::InvalidData => {
+                atom!("invalid_data")
+            }
             ParserError::IO(_) => atom!("input_output_error"),
             ParserError::LexicalError(_) => atom!("lexical_error"),
             ParserError::MissingQuote(..) => atom!("missing_quote"),
@@ -498,7 +484,7 @@ impl<'a, 'b> CompositeOpDir<'a, 'b> {
 
     #[inline]
     pub(crate) fn get(&self, name: Atom, fixity: Fixity) -> Option<OpDesc> {
-        let entry = if let Some(ref primary_op_dir) = &self.primary_op_dir {
+        let entry = if let Some(primary_op_dir) = &self.primary_op_dir {
             primary_op_dir.get(&(name, fixity))
         } else {
             None
@@ -522,9 +508,12 @@ pub enum Fixity {
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Fixnum {
     num: B56,
-    #[allow(unused)] f: bool,
-    #[allow(unused)] m: bool,
-    #[allow(unused)] tag: B6,
+    #[allow(unused)]
+    f: bool,
+    #[allow(unused)]
+    m: bool,
+    #[allow(unused)]
+    tag: B6,
 }
 
 impl Fixnum {
@@ -548,7 +537,7 @@ impl Fixnum {
 
     #[inline]
     pub fn get_tag(&self) -> HeapCellValueTag {
-        use modular_bitfield::Specifier;
+        use scryer_modular_bitfield::Specifier;
         HeapCellValueTag::from_bytes(self.tag()).unwrap()
     }
 
@@ -557,7 +546,7 @@ impl Fixnum {
         const UPPER_BOUND: i64 = (1 << 55) - 1;
         const LOWER_BOUND: i64 = -(1 << 55);
 
-        if LOWER_BOUND <= num && num <= UPPER_BOUND {
+        if (LOWER_BOUND..=UPPER_BOUND).contains(&num) {
             Ok(Fixnum::new()
                 .with_m(false)
                 .with_f(false)
@@ -572,7 +561,7 @@ impl Fixnum {
     pub fn get_num(self) -> i64 {
         let n = self.num() as i64;
         let (n, overflowed) = (n << 8).overflowing_shr(8);
-        debug_assert_eq!(overflowed, false);
+        debug_assert!(!overflowed);
         n
     }
 }
@@ -623,14 +612,13 @@ impl fmt::Display for Literal {
 }
 
 impl Literal {
-    pub fn to_atom(&self, atom_tbl: &mut AtomTable) -> Option<Atom> {
+    pub fn to_atom(&self, atom_tbl: &Arc<AtomTable>) -> Option<Atom> {
         match self {
             Literal::Atom(atom) => Some(atom.defrock_brackets(atom_tbl)),
             _ => None,
         }
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarPtr(Rc<RefCell<Var>>);
@@ -721,11 +709,12 @@ impl Var {
     #[inline(always)]
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Var::Named(value) => Some(&value),
+            Var::Named(value) => Some(value),
             _ => None,
         }
     }
 
+    #[allow(clippy::inherent_to_string)]
     #[inline(always)]
     pub fn to_string(&self) -> String {
         match self {
@@ -791,21 +780,17 @@ impl Term {
 
 #[inline]
 pub fn source_arity(terms: &[Term]) -> usize {
-    if let Some(last_arg) = terms.last() {
-        if let Term::Literal(_, Literal::CodeIndex(_)) = last_arg {
-            return terms.len() - 1;
-        }
+    if let Some(Term::Literal(_, Literal::CodeIndex(_))) = terms.last() {
+        return terms.len() - 1;
     }
 
     terms.len()
 }
 
-fn unfold_by_str_once(term: &mut Term, s: Atom) -> Option<(Term, Term)> {
+pub(crate) fn unfold_by_str_once(term: &mut Term, s: Atom) -> Option<(Term, Term)> {
     if let Term::Clause(_, ref name, ref mut subterms) = term {
-        if let Some(last_arg) = subterms.last() {
-            if let Term::Literal(_, Literal::CodeIndex(_)) = last_arg {
-                subterms.pop();
-            }
+        if let Some(Term::Literal(_, Literal::CodeIndex(_))) = subterms.last() {
+            subterms.pop();
         }
 
         if name == &s && subterms.len() == 2 {
@@ -830,30 +815,3 @@ pub fn unfold_by_str(mut term: Term, s: Atom) -> Vec<Term> {
     terms.push(term);
     terms
 }
-
-fn unfold_by_str_ref_once(term: &Term, s: Atom) -> Option<(&Term, &Term)> {
-    if let Term::Clause(_, ref name, ref subterms) = term {
-        if name == &s && subterms.len() == 2 {
-            let fst = &subterms[0];
-            let snd = &subterms[1];
-
-            return Some((fst, snd));
-        }
-    }
-
-    None
-}
-
-pub fn unfold_by_str_ref(mut term: &Term, s: Atom) -> Vec<&Term> {
-    let mut terms = vec![];
-
-    while let Some((fst, snd)) = unfold_by_str_ref_once(&term, s) {
-        terms.push(fst);
-        term = snd;
-    }
-
-    terms.push(term);
-    terms
-}
-
-

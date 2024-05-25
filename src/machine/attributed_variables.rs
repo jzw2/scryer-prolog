@@ -118,12 +118,9 @@ impl MachineState {
             and_frame[i] = self.registers[i];
         }
 
-        and_frame[arity + 1] =
-            fixnum_as_cell!(Fixnum::build_with(self.b0 as i64));
-        and_frame[arity + 2] =
-            fixnum_as_cell!(Fixnum::build_with(self.num_of_args as i64));
-        and_frame[arity + 3] =
-            fixnum_as_cell!(Fixnum::build_with(self.attr_var_init.cp as i64));
+        and_frame[arity + 1] = fixnum_as_cell!(Fixnum::build_with(self.b0 as i64));
+        and_frame[arity + 2] = fixnum_as_cell!(Fixnum::build_with(self.num_of_args as i64));
+        and_frame[arity + 3] = fixnum_as_cell!(Fixnum::build_with(self.attr_var_init.cp as i64));
 
         self.verify_attributes();
 
@@ -136,7 +133,8 @@ impl MachineState {
         let mut seen_set = IndexSet::new();
         let mut seen_vars = vec![];
 
-        let mut iter = stackful_preorder_iter(&mut self.heap, &mut self.stack, cell);
+        let mut iter =
+            stackful_preorder_iter::<NonListElider>(&mut self.heap, &mut self.stack, cell);
 
         while let Some(value) = iter.next() {
             read_heap_cell!(value,

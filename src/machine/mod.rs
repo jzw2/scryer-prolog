@@ -5,18 +5,22 @@ pub mod code_walker;
 #[macro_use]
 pub mod loader;
 pub mod compile;
+pub mod config;
 pub mod copier;
+pub mod cycle_detection;
+pub mod disjuncts;
 pub mod dispatch;
 pub mod gc;
 pub mod heap;
+pub mod lib_machine;
 pub mod load_state;
 pub mod machine_errors;
 pub mod machine_indices;
 pub mod machine_state;
 pub mod machine_state_impl;
 pub mod mock_wam;
+pub mod parsed_results;
 pub mod partial_string;
-pub mod disjuncts;
 pub mod preprocessor;
 pub mod stack;
 pub mod streams;
@@ -27,8 +31,9 @@ pub mod unify;
 use crate::arena::*;
 use crate::arithmetic::*;
 use crate::atom_table::*;
-use crate::forms::*;
+#[cfg(feature = "ffi")]
 use crate::ffi::ForeignFunctionTable;
+use crate::forms::*;
 use crate::instructions::*;
 use crate::machine::args::*;
 use crate::machine::compile::*;
@@ -41,18 +46,23 @@ use crate::machine::machine_state::*;
 use crate::machine::stack::*;
 use crate::machine::streams::*;
 use crate::parser::ast::*;
-use crate::parser::rug::{Integer, Rational};
+use crate::parser::dashu::{Integer, Rational};
 use crate::types::*;
 
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use ordered_float::OrderedFloat;
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::cmp::Ordering;
 use std::env;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use tokio::runtime::Runtime;
+
+use self::config::MachineConfig;
+use self::parsed_results::*;
 
 lazy_static! {
     pub static ref INTERRUPT: AtomicBool = AtomicBool::new(false);
@@ -67,8 +77,9 @@ pub struct Machine {
     pub(super) user_output: Stream,
     pub(super) user_error: Stream,
     pub(super) load_contexts: Vec<LoadContext>,
-    pub(super) runtime: Runtime,
+    #[cfg(feature = "ffi")]
     pub(super) foreign_function_table: ForeignFunctionTable,
+    pub(super) rng: StdRng,
 }
 
 #[derive(Debug)]
@@ -107,6 +118,7 @@ include!(concat!(env!("OUT_DIR"), "/libraries.rs"));
 pub static BREAK_FROM_DISPATCH_LOOP_LOC: usize = 0;
 pub static INSTALL_VERIFY_ATTR_INTERRUPT: usize = 1;
 pub static VERIFY_ATTR_INTERRUPT_LOC: usize = 2;
+pub static LIB_QUERY_SUCCESS: usize = 3;
 
 pub struct MachinePreludeView<'a> {
     pub indices: &'a mut IndexStore,
@@ -160,8 +172,11 @@ pub(crate) fn import_builtin_impls(code_dir: &CodeDir, builtins: &mut Module) {
 
     for key in keys {
         let idx = code_dir.get(&key).unwrap();
-        builtins.code_dir.insert(key, idx.clone());
-        builtins.module_decl.exports.push(ModuleExport::PredicateKey(key));
+        builtins.code_dir.insert(key, *idx);
+        builtins
+            .module_decl
+            .exports
+            .push(ModuleExport::PredicateKey(key));
     }
 }
 
@@ -192,8 +207,17 @@ impl Machine {
                 code: &mut self.code,
                 load_contexts: &mut self.load_contexts,
             },
-            &mut self.machine_st
+            &mut self.machine_st,
         )
+    }
+
+    pub fn get_inference_count(&mut self) -> u64 {
+        self.machine_st
+            .cwil
+            .global_count
+            .clone()
+            .try_into()
+            .unwrap()
     }
 
     pub fn throw_session_error(&mut self, err: SessionError, key: PredicateKey) {
@@ -204,9 +228,13 @@ impl Machine {
         self.machine_st.throw_exception(err);
     }
 
-    fn run_module_predicate(&mut self, module_name: Atom, key: PredicateKey) {
+    pub fn run_module_predicate(
+        &mut self,
+        module_name: Atom,
+        key: PredicateKey,
+    ) -> std::process::ExitCode {
         if let Some(module) = self.indices.modules.get(&module_name) {
-            if let Some(ref code_index) = module.code_dir.get(&key) {
+            if let Some(code_index) = module.code_dir.get(&key) {
                 let p = code_index.local().unwrap();
 
                 self.machine_st.cp = BREAK_FROM_DISPATCH_LOOP_LOC;
@@ -221,23 +249,19 @@ impl Machine {
 
     pub fn load_file(&mut self, path: &str, stream: Stream) {
         self.machine_st.registers[1] = stream_as_cell!(stream);
-        self.machine_st.registers[2] = atom_as_cell!(
-            self.machine_st.atom_tbl.build_with(path)
-        );
+        self.machine_st.registers[2] =
+            atom_as_cell!(AtomTable::build_with(&self.machine_st.atom_tbl, path));
 
         self.run_module_predicate(atom!("loader"), (atom!("file_load"), 2));
     }
 
-    fn load_top_level(&mut self) {
+    fn load_top_level(&mut self, program: &'static str) {
         let mut path_buf = current_dir();
 
         path_buf.push("src/toplevel.pl");
 
         let path = path_buf.to_str().unwrap();
-        let toplevel_stream = Stream::from_static_string(
-            include_str!("../toplevel.pl"),
-            &mut self.machine_st.arena,
-        );
+        let toplevel_stream = Stream::from_static_string(program, &mut self.machine_st.arena);
 
         self.load_file(path, toplevel_stream);
 
@@ -283,26 +307,21 @@ impl Machine {
         }
     }
 
-    pub fn run_top_level(&mut self) {
-        let mut arg_pstrs = vec![];
+    pub fn set_user_input(&mut self, input: String) {
+        self.user_input = Stream::from_owned_string(input, &mut self.machine_st.arena);
+    }
 
-        for arg in env::args() {
-            arg_pstrs.push(put_complete_string(
-                &mut self.machine_st.heap,
-                &arg,
-                &mut self.machine_st.atom_tbl,
-            ));
-        }
-
-        self.machine_st.registers[1] = heap_loc_as_cell!(
-            iter_to_heap_list(&mut self.machine_st.heap, arg_pstrs.into_iter())
-        );
-
-        self.run_module_predicate(atom!("$toplevel"), (atom!("$repl"), 1));
+    pub fn get_user_output(&self) -> String {
+        let output_bytes: Vec<_> = self.user_output.bytes().map(|b| b.unwrap()).collect();
+        String::from_utf8(output_bytes).unwrap()
     }
 
     pub(crate) fn configure_modules(&mut self) {
-        fn update_call_n_indices(loader: &Module, target_code_dir: &mut CodeDir, arena: &mut Arena) {
+        fn update_call_n_indices(
+            loader: &Module,
+            target_code_dir: &mut CodeDir,
+            arena: &mut Arena,
+        ) {
             for arity in 1..66 {
                 let key = (atom!("call"), arity);
 
@@ -347,10 +366,18 @@ impl Machine {
             }
 
             for (_, target_module) in self.indices.modules.iter_mut() {
-                update_call_n_indices(&loader, &mut target_module.code_dir, &mut self.machine_st.arena);
+                update_call_n_indices(
+                    &loader,
+                    &mut target_module.code_dir,
+                    &mut self.machine_st.arena,
+                );
             }
 
-            update_call_n_indices(&loader, &mut self.indices.code_dir, &mut self.machine_st.arena);
+            update_call_n_indices(
+                &loader,
+                &mut self.indices.code_dir,
+                &mut self.machine_st.arena,
+            );
 
             self.indices.modules.insert(atom!("loader"), loader);
         } else {
@@ -359,12 +386,13 @@ impl Machine {
     }
 
     pub(crate) fn add_impls_to_indices(&mut self) {
-        let impls_offset = self.code.len() + 3;
+        let impls_offset = self.code.len() + 4;
 
         self.code.extend(vec![
             Instruction::BreakFromDispatchLoop,
             Instruction::InstallVerifyAttr,
-            Instruction::VerifyAttrInterrupt,
+            Instruction::VerifyAttrInterrupt(0),
+            Instruction::BreakFromDispatchLoop, // the location of LIB_QUERY_SUCCESS
             Instruction::ExecuteTermGreaterThan,
             Instruction::ExecuteTermLessThan,
             Instruction::ExecuteTermGreaterThanOrEqual,
@@ -403,30 +431,40 @@ impl Machine {
             Instruction::ExecuteIsRational(temp_v!(1)),
             Instruction::ExecuteIsFloat(temp_v!(1)),
             Instruction::ExecuteIsNonVar(temp_v!(1)),
-            Instruction::ExecuteIsVar(temp_v!(1))
-        ].into_iter());
+            Instruction::ExecuteIsVar(temp_v!(1)),
+        ]);
 
-        for (p, instr) in self.code[impls_offset ..].iter().enumerate() {
+        for (p, instr) in self.code[impls_offset..].iter().enumerate() {
             let key = instr.to_name_and_arity();
             self.indices.code_dir.insert(
                 key,
-                CodeIndex::new(IndexPtr::index(p + impls_offset), &mut self.machine_st.arena),
+                CodeIndex::new(
+                    IndexPtr::index(p + impls_offset),
+                    &mut self.machine_st.arena,
+                ),
             );
         }
     }
 
-    pub fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new(config: MachineConfig) -> Self {
         use ref_thread_local::RefThreadLocal;
 
         let args = MachineArgs::new();
         let mut machine_st = MachineState::new();
 
-        let user_input = Stream::stdin(&mut machine_st.arena, args.add_history);
-        let user_output = Stream::stdout(&mut machine_st.arena);
-        let user_error = Stream::stderr(&mut machine_st.arena);
-
-        let runtime = tokio::runtime::Runtime::new()
-            .unwrap();
+        let (user_input, user_output, user_error) = match config.streams {
+            config::StreamConfig::Stdio => (
+                Stream::stdin(&mut machine_st.arena, args.add_history),
+                Stream::stdout(&mut machine_st.arena),
+                Stream::stderr(&mut machine_st.arena),
+            ),
+            config::StreamConfig::Memory => (
+                Stream::Null(StreamOptions::default()),
+                Stream::from_owned_string("".to_owned(), &mut machine_st.arena),
+                Stream::stderr(&mut machine_st.arena),
+            ),
+        };
 
         let mut wam = Machine {
             machine_st,
@@ -436,8 +474,9 @@ impl Machine {
             user_output,
             user_error,
             load_contexts: vec![],
-            runtime,
-	    foreign_function_table: Default::default(),
+            #[cfg(feature = "ffi")]
+            foreign_function_table: Default::default(),
+            rng: StdRng::from_entropy(),
         };
 
         let mut lib_path = current_dir();
@@ -461,10 +500,7 @@ impl Machine {
         .unwrap();
 
         bootstrapping_compile(
-            Stream::from_static_string(
-                LIBRARIES.borrow()["builtins"],
-                &mut wam.machine_st.arena,
-            ),
+            Stream::from_static_string(LIBRARIES.borrow()["builtins"], &mut wam.machine_st.arena),
             &mut wam,
             ListingSource::from_file_and_path(atom!("builtins.pl"), lib_path.clone()),
         )
@@ -510,14 +546,16 @@ impl Machine {
         }
 
         wam.load_special_forms();
-        wam.load_top_level();
+        wam.load_top_level(config.toplevel);
         wam.configure_streams();
 
         wam
     }
 
     pub(crate) fn configure_streams(&mut self) {
-        self.user_input.options_mut().set_alias_to_atom_opt(Some(atom!("user_input")));
+        self.user_input
+            .options_mut()
+            .set_alias_to_atom_opt(Some(atom!("user_input")));
 
         self.indices
             .stream_aliases
@@ -525,7 +563,9 @@ impl Machine {
 
         self.indices.streams.insert(self.user_input);
 
-        self.user_output.options_mut().set_alias_to_atom_opt(Some(atom!("user_output")));
+        self.user_output
+            .options_mut()
+            .set_alias_to_atom_opt(Some(atom!("user_output")));
 
         self.indices
             .stream_aliases
@@ -555,9 +595,16 @@ impl Machine {
 
                     loop {
                         let indexing_code_ptr = match &indexing_lines[oip] {
-                            &IndexingLine::Indexing(IndexingInstruction::SwitchOnTerm(arg, v, c, l, s)) => {
+                            &IndexingLine::Indexing(IndexingInstruction::SwitchOnTerm(
+                                arg,
+                                v,
+                                c,
+                                l,
+                                s,
+                            )) => {
                                 cell = self.deref_register(arg);
-                                self.machine_st.select_switch_on_term_index(cell, v, c, l, s)
+                                self.machine_st
+                                    .select_switch_on_term_index(cell, v, c, l, s)
                             }
                             IndexingLine::Indexing(IndexingInstruction::SwitchOnConstant(hm)) => {
                                 let lit = self.machine_st.constant_to_literal(cell);
@@ -667,7 +714,12 @@ impl Machine {
                         }
                     );
                 }
-                &Instruction::GetPartialString(Level::Shallow, string, RegType::Temp(t), has_tail) => {
+                &Instruction::GetPartialString(
+                    Level::Shallow,
+                    string,
+                    RegType::Temp(t),
+                    has_tail,
+                ) => {
                     let cell = self.deref_register(t);
 
                     read_heap_cell!(cell,
@@ -698,17 +750,17 @@ impl Machine {
                         }
                     );
                 }
-                Instruction::GetConstant(..) |
-                Instruction::GetList(..) |
-                Instruction::GetStructure(..) |
-                Instruction::GetPartialString(..) |
-                &Instruction::UnifyVoid(..) |
-                &Instruction::UnifyConstant(..) |
-                &Instruction::GetVariable(..) |
-                &Instruction::GetValue(..) |
-                &Instruction::UnifyVariable(..) |
-                &Instruction::UnifyValue(..) |
-                &Instruction::UnifyLocalValue(..)  => {
+                Instruction::GetConstant(..)
+                | Instruction::GetList(..)
+                | Instruction::GetStructure(..)
+                | Instruction::GetPartialString(..)
+                | &Instruction::UnifyVoid(..)
+                | &Instruction::UnifyConstant(..)
+                | &Instruction::GetVariable(..)
+                | &Instruction::GetValue(..)
+                | &Instruction::UnifyVariable(..)
+                | &Instruction::UnifyValue(..)
+                | &Instruction::UnifyLocalValue(..) => {
                     offset += 1;
                 }
                 _ => {
@@ -723,9 +775,10 @@ impl Machine {
     fn next_applicable_clause(&mut self, mut offset: usize) -> Option<usize> {
         while !self.next_clause_applicable(self.machine_st.p + offset + 1) {
             match &self.code[self.machine_st.p + offset] {
-                &Instruction::DefaultRetryMeElse(o) | &Instruction::RetryMeElse(o) |
-                &Instruction::DynamicElse(.., NextOrFail::Next(o)) |
-                &Instruction::DynamicInternalElse(.., NextOrFail::Next(o)) => offset += o,
+                &Instruction::DefaultRetryMeElse(o)
+                | &Instruction::RetryMeElse(o)
+                | &Instruction::DynamicElse(.., NextOrFail::Next(o))
+                | &Instruction::DynamicInternalElse(.., NextOrFail::Next(o)) => offset += o,
                 _ => {
                     return None;
                 }
@@ -744,14 +797,16 @@ impl Machine {
                     match &indexing_lines[self.machine_st.oip as usize] {
                         IndexingLine::IndexedChoice(indexed_choice) => {
                             match &indexed_choice[(self.machine_st.iip + inner_offset) as usize] {
-                                &IndexedChoiceInstruction::Retry(o) => {
+                                &IndexedChoiceInstruction::Retry(o)
+                                | &IndexedChoiceInstruction::DefaultRetry(o) => {
                                     if self.next_clause_applicable(self.machine_st.p + o) {
                                         return Some(inner_offset);
                                     }
 
                                     inner_offset += 1;
                                 }
-                                &IndexedChoiceInstruction::Trust(o) => {
+                                &IndexedChoiceInstruction::Trust(o)
+                                | &IndexedChoiceInstruction::DefaultTrust(o) => {
                                     return if self.next_clause_applicable(self.machine_st.p + o) {
                                         Some(inner_offset)
                                     } else {
@@ -804,12 +859,13 @@ impl Machine {
             or_frame.prelude.tr = self.machine_st.tr;
             or_frame.prelude.h = self.machine_st.heap.len();
             or_frame.prelude.b0 = self.machine_st.b0;
-            or_frame.prelude.attr_var_queue_len = self.machine_st.attr_var_init.attr_var_queue.len();
+            or_frame.prelude.attr_var_queue_len =
+                self.machine_st.attr_var_init.attr_var_queue.len();
 
             self.machine_st.b = b;
 
             for i in 0..n {
-                or_frame[i] = self.machine_st.registers[i+1];
+                or_frame[i] = self.machine_st.registers[i + 1];
             }
 
             self.machine_st.hb = self.machine_st.heap.len();
@@ -835,18 +891,19 @@ impl Machine {
             or_frame.prelude.tr = self.machine_st.tr;
             or_frame.prelude.h = self.machine_st.heap.len();
             or_frame.prelude.b0 = self.machine_st.b0;
-            or_frame.prelude.attr_var_queue_len = self.machine_st.attr_var_init.attr_var_queue.len();
+            or_frame.prelude.attr_var_queue_len =
+                self.machine_st.attr_var_init.attr_var_queue.len();
 
             self.machine_st.b = b;
 
             for i in 0..n {
-                or_frame[i] = self.machine_st.registers[i+1];
+                or_frame[i] = self.machine_st.registers[i + 1];
             }
 
             self.machine_st.hb = self.machine_st.heap.len();
 
-            self.machine_st.oip = 0;
-            self.machine_st.iip = 0;
+            // self.machine_st.oip = 0;
+            // self.machine_st.iip = 0;
         }
 
         self.machine_st.p += offset;
@@ -903,7 +960,7 @@ impl Machine {
         let curr_tr = self.machine_st.tr;
 
         for i in 0..n {
-            self.machine_st.registers[i+1] = or_frame[i];
+            self.machine_st.registers[i + 1] = or_frame[i];
         }
 
         self.unwind_trail(old_tr, curr_tr);
@@ -930,8 +987,22 @@ impl Machine {
 
             self.machine_st.heap.truncate(target_h);
 
-            self.machine_st.oip = 0;
-            self.machine_st.iip = 0;
+            // these registers don't need to be reset here and MUST
+            // NOT be (nor in indexed_try! trust_epilogue is an
+            // exception, see next paragraph)! oip could be reset
+            // without any adverse effects but iip is needed by
+            // get_clause_p to find the last executed clause/2 clause.
+
+            // trust_epilogue must reset these for the sake of
+            // subsequent predicates beginning with
+            // switch_to_term. get_clause_p copes by checking
+            // self.machine_st.b > self.machine.e: if true, it is safe
+            // to use self.machine_st.iip; if false, use the choice
+            // point left at the top of the stack by '$clause'
+            // (specifically its biip value).
+
+            // self.machine_st.oip = 0;
+            // self.machine_st.iip = 0;
         } else {
             self.trust_epilogue(offset);
         }
@@ -947,7 +1018,7 @@ impl Machine {
         let curr_tr = self.machine_st.tr;
 
         for i in 0..n {
-            self.machine_st.registers[i+1] = or_frame[i];
+            self.machine_st.registers[i + 1] = or_frame[i];
         }
 
         self.unwind_trail(old_tr, curr_tr);
@@ -974,7 +1045,7 @@ impl Machine {
         self.reset_attr_var_state(or_frame.prelude.attr_var_queue_len);
 
         self.machine_st.hb = target_h;
-        self.machine_st.p = self.machine_st.p + offset;
+        self.machine_st.p += offset;
 
         self.machine_st.stack.truncate(b);
         self.machine_st.heap.truncate(target_h);
@@ -990,7 +1061,7 @@ impl Machine {
         let n = or_frame.prelude.num_cells;
 
         for i in 0..n {
-            self.machine_st.registers[i+1] = or_frame[i];
+            self.machine_st.registers[i + 1] = or_frame[i];
         }
 
         let old_tr = or_frame.prelude.tr;
@@ -1029,15 +1100,17 @@ impl Machine {
     #[inline(always)]
     fn undefined_procedure(&mut self, name: Atom, arity: usize) -> CallResult {
         match self.machine_st.flags.unknown {
-            Unknown::Error => {
-                Err(self.machine_st.throw_undefined_error(name, arity))
-            }
+            Unknown::Error => Err(self.machine_st.throw_undefined_error(name, arity)),
             Unknown::Fail => {
                 self.machine_st.fail = true;
                 Ok(())
             }
             Unknown::Warn => {
-                println!("warning: predicate {}/{} is undefined", name.as_str(), arity);
+                println!(
+                    "% Warning: predicate {}/{} is undefined",
+                    name.as_str(),
+                    arity
+                );
                 self.machine_st.fail = true;
                 Ok(())
             }
@@ -1082,9 +1155,7 @@ impl Machine {
                 self.machine_st.dynamic_mode = FirstOrNext::First;
                 self.machine_st.execute_at_index(arity, compiled_tl_index);
             }
-            IndexPtrTag::Index => {
-                self.machine_st.execute_at_index(arity, compiled_tl_index)
-            }
+            IndexPtrTag::Index => self.machine_st.execute_at_index(arity, compiled_tl_index),
         }
 
         Ok(())
@@ -1100,19 +1171,23 @@ impl Machine {
             } else {
                 Err(self.machine_st.throw_undefined_error(name, arity))
             }
-        } else {
-            if let Some(module) = self.indices.modules.get(&module_name) {
-                if let Some(idx) = module.code_dir.get(&(name, arity)).cloned() {
-                    self.try_call(name, arity, idx.get())
-                } else {
-                    self.undefined_procedure(name, arity)
-                }
+        } else if let Some(module) = self.indices.modules.get(&module_name) {
+            if let Some(idx) = module.code_dir.get(&(name, arity)).cloned() {
+                self.try_call(name, arity, idx.get())
             } else {
-                let stub = functor_stub(name, arity);
-                let err = self.machine_st.module_resolution_error(module_name, name, arity);
-
-                Err(self.machine_st.error_form(err, stub))
+                self.undefined_procedure(name, arity)
             }
+        } else {
+            let stub = functor_stub(name, arity);
+            let err = self
+                .machine_st
+                .existence_error(ExistenceError::QualifiedProcedure {
+                    module_name,
+                    name,
+                    arity,
+                });
+
+            Err(self.machine_st.error_form(err, stub))
         }
     }
 
@@ -1126,19 +1201,23 @@ impl Machine {
             } else {
                 self.undefined_procedure(name, arity)
             }
-        } else {
-            if let Some(module) = self.indices.modules.get(&module_name) {
-                if let Some(idx) = module.code_dir.get(&(name, arity)).cloned() {
-                    self.try_execute(name, arity, idx.get())
-                } else {
-                    self.undefined_procedure(name, arity)
-                }
+        } else if let Some(module) = self.indices.modules.get(&module_name) {
+            if let Some(idx) = module.code_dir.get(&(name, arity)).cloned() {
+                self.try_execute(name, arity, idx.get())
             } else {
-                let stub = functor_stub(name, arity);
-                let err = self.machine_st.module_resolution_error(module_name, name, arity);
-
-                Err(self.machine_st.error_form(err, stub))
+                self.undefined_procedure(name, arity)
             }
+        } else {
+            let stub = functor_stub(name, arity);
+            let err = self
+                .machine_st
+                .existence_error(ExistenceError::QualifiedProcedure {
+                    module_name,
+                    name,
+                    arity,
+                });
+
+            Err(self.machine_st.error_form(err, stub))
         }
     }
 
@@ -1169,12 +1248,16 @@ impl Machine {
                 let r_c_wo_h_atom = atom!("run_cleaners_without_handling");
                 let iso_ext = atom!("iso_ext");
 
-                RCWH = self.indices.get_predicate_code_index(r_c_w_h_atom, 0, iso_ext)
-                           .and_then(|item| item.local())
-                           .unwrap();
-                RCWOH = self.indices.get_predicate_code_index(r_c_wo_h_atom, 1, iso_ext)
-                            .and_then(|item| item.local())
-                            .unwrap();
+                RCWH = self
+                    .indices
+                    .get_predicate_code_index(r_c_w_h_atom, 0, iso_ext)
+                    .and_then(|item| item.local())
+                    .unwrap();
+                RCWOH = self
+                    .indices
+                    .get_predicate_code_index(r_c_wo_h_atom, 1, iso_ext)
+                    .and_then(|item| item.local())
+                    .unwrap();
             });
 
             (RCWH, RCWOH)
@@ -1185,9 +1268,8 @@ impl Machine {
                 let (idx, arity) = if self.machine_st.effective_block() > prev_block {
                     (r_c_w_h, 0)
                 } else {
-                    self.machine_st.registers[1] = fixnum_as_cell!(
-                        Fixnum::build_with(b_cutoff as i64)
-                    );
+                    self.machine_st.registers[1] =
+                        fixnum_as_cell!(Fixnum::build_with(b_cutoff as i64));
 
                     (r_c_wo_h, 1)
                 };
@@ -1238,7 +1320,7 @@ impl Machine {
                     }
                 }
                 TrailEntryTag::TrailedBlackboardEntry => {
-                    let key = Atom::from(h);
+                    let key = Atom::from(h as u64);
 
                     match self.indices.global_variables.get_mut(&key) {
                         Some((_, ref mut loc)) => *loc = None,
@@ -1246,7 +1328,7 @@ impl Machine {
                     }
                 }
                 TrailEntryTag::TrailedBlackboardOffset => {
-                    let key = Atom::from(h);
+                    let key = Atom::from(h as u64);
                     let value_cell = HeapCellValue::from(u64::from(self.machine_st.trail[i + 1]));
 
                     match self.indices.global_variables.get_mut(&key) {
@@ -1254,8 +1336,7 @@ impl Machine {
                         None => unreachable!(),
                     }
                 }
-                TrailEntryTag::TrailedAttachedValue => {
-                }
+                TrailEntryTag::TrailedAttachedValue => {}
             }
         }
     }

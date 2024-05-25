@@ -19,7 +19,6 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::fmt;
-use std::mem;
 use std::ops::{Deref, DerefMut};
 
 /*
@@ -32,8 +31,7 @@ use std::ops::{Deref, DerefMut};
  * loader.pl does a few high-level things more easily handled from
  * Prolog that are not supported (or needed) during bootstrapping:
  * term and goal expansion, loading modules from different streams,
- * verifying certain kinds of declarations, perhaps (in the future?)
- * compiling inline disjunctions.
+ * and verifying certain kinds of declarations.
  *
  * Since the loader can operate incrementally, it uses an intermittent
  * structure to rebuild the loader between invocations. Preprocessor
@@ -137,7 +135,7 @@ impl RetractionInfo {
 
         Self {
             orig_code_extent,
-            records: mem::replace(&mut self.records, vec![]),
+            records: std::mem::take(&mut self.records),
         }
     }
 }
@@ -150,9 +148,10 @@ impl<'a, LS: LoadState<'a>> Drop for Loader<'a, LS> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
 pub enum CompilationTarget {
     Module(Atom),
+    #[default]
     User,
 }
 
@@ -162,13 +161,6 @@ impl fmt::Display for CompilationTarget {
             CompilationTarget::User => write!(f, "user"),
             CompilationTarget::Module(ref module_name) => write!(f, "{}", module_name.as_str()),
         }
-    }
-}
-
-impl Default for CompilationTarget {
-    #[inline]
-    fn default() -> Self {
-        CompilationTarget::User
     }
 }
 
@@ -208,8 +200,8 @@ impl PredicateQueue {
     #[inline]
     pub(super) fn take(&mut self) -> Self {
         Self {
-            predicates: mem::replace(&mut self.predicates, vec![]),
-            compilation_target: self.compilation_target.clone(),
+            predicates: std::mem::take(&mut self.predicates),
+            compilation_target: self.compilation_target,
         }
     }
 
@@ -231,9 +223,7 @@ macro_rules! predicate_queue {
 
 pub type LiveLoadState = LoadStatePayload<LiveTermStream>;
 
-pub struct BootstrappingLoadState<'a>(
-    pub LoadStatePayload<BootstrappingTermStream<'a>>
-);
+pub struct BootstrappingLoadState<'a>(pub LoadStatePayload<BootstrappingTermStream<'a>>);
 
 impl<'a> Deref for BootstrappingLoadState<'a> {
     type Target = LoadStatePayload<BootstrappingTermStream<'a>>;
@@ -254,9 +244,12 @@ impl<'a> DerefMut for BootstrappingLoadState<'a> {
 pub trait LoadState<'a>: Sized {
     type Evacuable;
     type TS: TermStream;
-    type LoaderFieldType: DerefMut<Target=LoadStatePayload<Self::TS>>;
+    type LoaderFieldType: DerefMut<Target = LoadStatePayload<Self::TS>>;
 
-    fn new(machine_st: &'a mut MachineState, payload: LoadStatePayload<Self::TS>) -> Self::LoaderFieldType;
+    fn new(
+        machine_st: &'a mut MachineState,
+        payload: LoadStatePayload<Self::TS>,
+    ) -> Self::LoaderFieldType;
     fn evacuate(loader: Loader<'a, Self>) -> Result<Self::Evacuable, SessionError>;
     fn should_drop_load_state(loader: &Loader<'a, Self>) -> bool;
     fn reset_machine(loader: &mut Loader<'a, Self>);
@@ -265,6 +258,10 @@ pub trait LoadState<'a>: Sized {
         loader: &Loader<'a, Self>,
         key: PredicateKey,
     ) -> Result<(), SessionError>;
+
+    fn err_on_builtin_module_overwrite(_module_name: Atom) -> Result<(), SessionError> {
+        Ok(())
+    }
 }
 
 pub struct LiveLoadAndMachineState<'a> {
@@ -294,14 +291,23 @@ impl<'a> LoadState<'a> for LiveLoadAndMachineState<'a> {
     type Evacuable = TypedArenaPtr<LiveLoadState>;
 
     #[inline(always)]
-    fn new(machine_st: &'a mut MachineState, payload: LoadStatePayload<Self::TS>) -> Self::LoaderFieldType {
+    fn new(
+        machine_st: &'a mut MachineState,
+        payload: LoadStatePayload<Self::TS>,
+    ) -> Self::LoaderFieldType {
         let load_state = arena_alloc!(payload, &mut machine_st.arena);
-        LiveLoadAndMachineState { load_state, machine_st }
+        LiveLoadAndMachineState {
+            load_state,
+            machine_st,
+        }
     }
 
     #[inline(always)]
     fn evacuate(mut loader: Loader<'a, Self>) -> Result<Self::Evacuable, SessionError> {
-        loader.payload.load_state.set_tag(ArenaHeaderTag::InactiveLoadState);
+        loader
+            .payload
+            .load_state
+            .set_tag(ArenaHeaderTag::InactiveLoadState);
         Ok(loader.payload.load_state)
     }
 
@@ -333,12 +339,25 @@ impl<'a> LoadState<'a> for LiveLoadAndMachineState<'a> {
         }
 
         if let Some(builtins) = loader.wam_prelude.indices.modules.get(&atom!("builtins")) {
-            if builtins.module_decl.exports.contains(&ModuleExport::PredicateKey(key)) {
+            if builtins
+                .module_decl
+                .exports
+                .contains(&ModuleExport::PredicateKey(key))
+            {
                 return Err(SessionError::CannotOverwriteBuiltIn(key));
             }
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn err_on_builtin_module_overwrite(module_name: Atom) -> Result<(), SessionError> {
+        if LIBRARIES.borrow().contains_key(&*module_name.as_str()) {
+            Err(SessionError::CannotOverwriteBuiltInModule(module_name))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -359,10 +378,7 @@ impl<'a> LoadState<'a> for BootstrappingLoadState<'a> {
 
         let repo_len = loader.wam_prelude.code.len();
 
-        loader
-            .payload
-            .retraction_info
-            .reset(repo_len);
+        loader.payload.retraction_info.reset(repo_len);
 
         loader.remove_module_op_exports();
 
@@ -381,7 +397,7 @@ impl<'a> LoadState<'a> for BootstrappingLoadState<'a> {
 
     #[inline(always)]
     fn machine_st(loader: &mut Self::LoaderFieldType) -> &mut MachineState {
-        &mut loader.term_stream.parser.lexer.machine_st
+        loader.term_stream.parser.lexer.machine_st
     }
 
     #[inline(always)]
@@ -420,26 +436,31 @@ impl<'a> LoadState<'a> for InlineLoadState<'a> {
     type Evacuable = ();
 
     #[inline(always)]
-    fn new(machine_st: &'a mut MachineState, payload: LoadStatePayload<Self::TS>) -> Self::LoaderFieldType {
-	InlineLoadState { machine_st, payload }
+    fn new(
+        machine_st: &'a mut MachineState,
+        payload: LoadStatePayload<Self::TS>,
+    ) -> Self::LoaderFieldType {
+        InlineLoadState {
+            machine_st,
+            payload,
+        }
     }
 
     fn evacuate(_loader: Loader<'a, Self>) -> Result<Self::Evacuable, SessionError> {
-	Ok(())
+        Ok(())
     }
 
     #[inline(always)]
     fn should_drop_load_state(_loader: &Loader<'a, Self>) -> bool {
-	false
+        false
     }
 
     #[inline(always)]
-    fn reset_machine(_loader: &mut Loader<'a, Self>) {
-    }
+    fn reset_machine(_loader: &mut Loader<'a, Self>) {}
 
     #[inline(always)]
     fn machine_st(load_state: &mut Self::LoaderFieldType) -> &mut MachineState {
-        &mut load_state.machine_st
+        load_state.machine_st
     }
 
     #[inline(always)]
@@ -468,7 +489,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
         }
     }
 
-    pub(crate) fn read_term_from_heap(&mut self, r: RegType) -> Result<Term, SessionError> {
+    pub(crate) fn read_term_from_heap(&mut self, r: RegType) -> Term {
         let machine_st = LS::machine_st(&mut self.payload);
         let cell = machine_st[r];
 
@@ -518,11 +539,13 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 self.add_meta_predicate_record(module_name, name, meta_specs);
             }
             Declaration::Module(module_decl) => {
-                self.payload.compilation_target = CompilationTarget::Module(module_decl.name);
+                let module_name = module_decl.name;
+
+                self.payload.compilation_target = CompilationTarget::Module(module_name);
                 self.payload.predicates.compilation_target = self.payload.compilation_target;
 
                 let listing_src = self.payload.term_stream.listing_src().clone();
-                self.add_module(module_decl, listing_src);
+                self.add_module(module_decl, listing_src)?;
             }
             Declaration::NonCountedBacktracking(name, arity) => {
                 self.payload.non_counted_bt_preds.insert((name, arity));
@@ -549,7 +572,12 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                         atom!("user") => {
                             self.wam_prelude.indices.meta_predicates.remove(&key);
                         }
-                        _ => match self.wam_prelude.indices.modules.get_mut(&target_module_name) {
+                        _ => match self
+                            .wam_prelude
+                            .indices
+                            .modules
+                            .get_mut(&target_module_name)
+                        {
                             Some(ref mut module) => {
                                 module.meta_predicates.remove(&key);
                             }
@@ -567,7 +595,12 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                                 .meta_predicates
                                 .insert((name, meta_specs.len()), meta_specs);
                         }
-                        _ => match self.wam_prelude.indices.modules.get_mut(&target_module_name) {
+                        _ => match self
+                            .wam_prelude
+                            .indices
+                            .modules
+                            .get_mut(&target_module_name)
+                        {
                             Some(ref mut module) => {
                                 module
                                     .meta_predicates
@@ -599,22 +632,19 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 RetractionRecord::AddedDiscontiguousPredicate(compilation_target, key) => {
                     match compilation_target {
                         CompilationTarget::User => {
-                            self.wam_prelude
-                                .indices
-                                .extensible_predicates
-                                .get_mut(&key)
-                                .map(|skeleton| {
-                                    skeleton.core.is_discontiguous = false;
-                                });
+                            if let Some(skeleton) =
+                                self.wam_prelude.indices.extensible_predicates.get_mut(&key)
+                            {
+                                skeleton.core.is_discontiguous = false;
+                            }
                         }
                         CompilationTarget::Module(module_name) => {
-                            match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                                Some(ref mut module) => {
-                                    module.extensible_predicates.get_mut(&key).map(|skeleton| {
-                                        skeleton.core.is_discontiguous = false;
-                                    });
+                            if let Some(ref mut module) =
+                                self.wam_prelude.indices.modules.get_mut(&module_name)
+                            {
+                                if let Some(skeleton) = module.extensible_predicates.get_mut(&key) {
+                                    skeleton.core.is_discontiguous = false;
                                 }
-                                None => {}
                             }
                         }
                     }
@@ -622,23 +652,20 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 RetractionRecord::AddedDynamicPredicate(compilation_target, key) => {
                     match compilation_target {
                         CompilationTarget::User => {
-                            self.wam_prelude
-                                .indices
-                                .extensible_predicates
-                                .get_mut(&key)
-                                .map(|skeleton| {
-                                    skeleton.core.is_dynamic = false;
-                                });
+                            if let Some(skeleton) =
+                                self.wam_prelude.indices.extensible_predicates.get_mut(&key)
+                            {
+                                skeleton.core.is_dynamic = false;
+                            }
                         }
                         CompilationTarget::Module(module_name) => {
-                            match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                                Some(ref mut module) => {
-                                    module.extensible_predicates.get_mut(&key).map(|skeleton| {
-                                        skeleton.core.is_dynamic = false;
-                                        skeleton.core.retracted_dynamic_clauses = None;
-                                    });
-                                }
-                                None => {}
+                            if let Some(ref mut module) =
+                                self.wam_prelude.indices.modules.get_mut(&module_name)
+                            {
+                                if let Some(skeleton) = module.extensible_predicates.get_mut(&key) {
+                                    skeleton.core.is_dynamic = false;
+                                    skeleton.core.retracted_dynamic_clauses = None;
+                                };
                             }
                         }
                     }
@@ -646,60 +673,52 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 RetractionRecord::AddedMultifilePredicate(compilation_target, key) => {
                     match compilation_target {
                         CompilationTarget::User => {
-                            self.wam_prelude
-                                .indices
-                                .extensible_predicates
-                                .get_mut(&key)
-                                .map(|skeleton| {
-                                    skeleton.core.is_multifile = false;
-                                });
+                            if let Some(skeleton) =
+                                self.wam_prelude.indices.extensible_predicates.get_mut(&key)
+                            {
+                                skeleton.core.is_multifile = false;
+                            }
                         }
                         CompilationTarget::Module(module_name) => {
-                            match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                                Some(ref mut module) => {
-                                    module.extensible_predicates.get_mut(&key).map(|skeleton| {
-                                        skeleton.core.is_multifile = false;
-                                    });
+                            if let Some(ref mut module) =
+                                self.wam_prelude.indices.modules.get_mut(&module_name)
+                            {
+                                if let Some(skeleton) = module.extensible_predicates.get_mut(&key) {
+                                    skeleton.core.is_multifile = false;
                                 }
-                                None => {}
                             }
                         }
                     }
                 }
                 RetractionRecord::AddedModuleOp(module_name, mut op_decl) => {
-                    match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                        Some(ref mut module) => {
-                            op_decl.remove(&mut module.op_dir);
-                        }
-                        None => {}
+                    if let Some(ref mut module) =
+                        self.wam_prelude.indices.modules.get_mut(&module_name)
+                    {
+                        op_decl.remove(&mut module.op_dir);
                     }
                 }
                 RetractionRecord::ReplacedModuleOp(module_name, mut op_decl, op_desc) => {
-                    match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                        Some(ref mut module) => {
-                            op_decl.op_desc = op_desc;
-                            op_decl.insert_into_op_dir(&mut module.op_dir);
-                        }
-                        None => {}
+                    if let Some(ref mut module) =
+                        self.wam_prelude.indices.modules.get_mut(&module_name)
+                    {
+                        op_decl.op_desc = op_desc;
+                        op_decl.insert_into_op_dir(&mut module.op_dir);
                     }
                 }
                 RetractionRecord::AddedModulePredicate(module_name, key) => {
-                    match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                        Some(ref mut module) => {
-                            module.code_dir.remove(&key);
-                        }
-                        None => {}
+                    if let Some(ref mut module) =
+                        self.wam_prelude.indices.modules.get_mut(&module_name)
+                    {
+                        module.code_dir.remove(&key);
                     }
                 }
                 RetractionRecord::ReplacedModulePredicate(module_name, key, old_code_idx) => {
-                    match self.wam_prelude.indices.modules.get_mut(&module_name) {
-                        Some(ref mut module) => {
-                            module
-                                .code_dir
-                                .get_mut(&key)
-                                .map(|code_idx| code_idx.set(old_code_idx));
+                    if let Some(ref mut module) =
+                        self.wam_prelude.indices.modules.get_mut(&module_name)
+                    {
+                        if let Some(code_idx) = module.code_dir.get_mut(&key) {
+                            code_idx.set(old_code_idx)
                         }
-                        None => {}
                     }
                 }
                 RetractionRecord::AddedExtensiblePredicate(compilation_target, key) => {
@@ -718,11 +737,9 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                     self.wam_prelude.indices.code_dir.remove(&key);
                 }
                 RetractionRecord::ReplacedUserPredicate(key, old_code_idx) => {
-                    self.wam_prelude
-                        .indices
-                        .code_dir
-                        .get_mut(&key)
-                        .map(|code_idx| code_idx.set(old_code_idx));
+                    if let Some(code_idx) = self.wam_prelude.indices.code_dir.get_mut(&key) {
+                        code_idx.set(old_code_idx)
+                    }
                 }
                 RetractionRecord::AddedIndex(index_key, clause_loc) => {
                     if let Some(index_loc) = index_key.switch_on_term_loc() {
@@ -774,9 +791,9 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 }
                 RetractionRecord::ReplacedChoiceOffset(instr_loc, offset) => {
                     match self.wam_prelude.code[instr_loc] {
-                        Instruction::TryMeElse(ref mut o) |
-                        Instruction::RetryMeElse(ref mut o) |
-                        Instruction::DefaultRetryMeElse(ref mut o) => {
+                        Instruction::TryMeElse(ref mut o)
+                        | Instruction::RetryMeElse(ref mut o)
+                        | Instruction::DefaultRetryMeElse(ref mut o) => {
                             *o = offset;
                         }
                         _ => {
@@ -792,18 +809,17 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                     };
                 }
                 RetractionRecord::ReplacedSwitchOnTermVarIndex(index_loc, old_v) => {
-                    match self.wam_prelude.code[index_loc] {
-                        Instruction::IndexingCode(ref mut indexing_code) => match &mut indexing_code[0] {
-                            IndexingLine::Indexing(IndexingInstruction::SwitchOnTerm(
-                                _,
-                                ref mut v,
-                                ..,
-                            )) => {
-                                *v = old_v;
-                            }
-                            _ => {}
-                        },
-                        _ => {}
+                    if let Instruction::IndexingCode(ref mut indexing_code) =
+                        self.wam_prelude.code[index_loc]
+                    {
+                        if let IndexingLine::Indexing(IndexingInstruction::SwitchOnTerm(
+                            _,
+                            ref mut v,
+                            ..,
+                        )) = &mut indexing_code[0]
+                        {
+                            *v = old_v;
+                        }
                     }
                 }
                 RetractionRecord::ModifiedTryMeElse(instr_loc, o) => {
@@ -816,30 +832,24 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                     self.wam_prelude.code[instr_loc] = Instruction::RevJmpBy(o);
                 }
                 RetractionRecord::SkeletonClausePopBack(compilation_target, key) => {
-                    match self
+                    if let Some(skeleton) = self
                         .wam_prelude
                         .indices
                         .get_predicate_skeleton_mut(&compilation_target, &key)
                     {
-                        Some(skeleton) => {
-                            skeleton.clauses.pop_back();
-                            skeleton.core.clause_clause_locs.pop_back();
-                        }
-                        None => {}
+                        skeleton.clauses.pop_back();
+                        skeleton.core.clause_clause_locs.pop_back();
                     }
                 }
                 RetractionRecord::SkeletonClausePopFront(compilation_target, key) => {
-                    match self
+                    if let Some(skeleton) = self
                         .wam_prelude
                         .indices
                         .get_predicate_skeleton_mut(&compilation_target, &key)
                     {
-                        Some(skeleton) => {
-                            skeleton.clauses.pop_front();
-                            skeleton.core.clause_clause_locs.pop_front();
-                            skeleton.core.clause_assert_margin -= 1;
-                        }
-                        None => {}
+                        skeleton.clauses.pop_front();
+                        skeleton.core.clause_clause_locs.pop_front();
+                        skeleton.core.clause_assert_margin -= 1;
                     }
                 }
                 RetractionRecord::SkeletonLocalClauseClausePopFront(
@@ -849,16 +859,15 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 ) => {
                     let listing_src_file_name = self.listing_src_file_name();
 
-                    match self.wam_prelude.indices.get_local_predicate_skeleton_mut(
-                        src_compilation_target,
-                        local_compilation_target,
-                        listing_src_file_name,
-                        key,
-                    ) {
-                        Some(skeleton) => {
-                            skeleton.clause_clause_locs.pop_front();
-                        }
-                        None => {}
+                    if let Some(skeleton) =
+                        self.wam_prelude.indices.get_local_predicate_skeleton_mut(
+                            src_compilation_target,
+                            local_compilation_target,
+                            listing_src_file_name,
+                            key,
+                        )
+                    {
+                        skeleton.clause_clause_locs.pop_front();
                     }
                 }
                 RetractionRecord::SkeletonLocalClauseClausePopBack(
@@ -868,16 +877,15 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 ) => {
                     let listing_src_file_name = self.listing_src_file_name();
 
-                    match self.wam_prelude.indices.get_local_predicate_skeleton_mut(
-                        src_compilation_target,
-                        local_compilation_target,
-                        listing_src_file_name,
-                        key,
-                    ) {
-                        Some(skeleton) => {
-                            skeleton.clause_clause_locs.pop_back();
-                        }
-                        None => {}
+                    if let Some(skeleton) =
+                        self.wam_prelude.indices.get_local_predicate_skeleton_mut(
+                            src_compilation_target,
+                            local_compilation_target,
+                            listing_src_file_name,
+                            key,
+                        )
+                    {
+                        skeleton.clause_clause_locs.pop_back();
                     }
                 }
                 RetractionRecord::SkeletonLocalClauseTruncateBack(
@@ -888,29 +896,25 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 ) => {
                     let listing_src_file_name = self.listing_src_file_name();
 
-                    match self.wam_prelude.indices.get_local_predicate_skeleton_mut(
-                        src_compilation_target,
-                        local_compilation_target,
-                        listing_src_file_name,
-                        key,
-                    ) {
-                        Some(skeleton) => {
-                            skeleton.clause_clause_locs.truncate(len);
-                        }
-                        None => {}
+                    if let Some(skeleton) =
+                        self.wam_prelude.indices.get_local_predicate_skeleton_mut(
+                            src_compilation_target,
+                            local_compilation_target,
+                            listing_src_file_name,
+                            key,
+                        )
+                    {
+                        skeleton.clause_clause_locs.truncate(len);
                     }
                 }
                 RetractionRecord::SkeletonClauseTruncateBack(compilation_target, key, len) => {
-                    match self
+                    if let Some(skeleton) = self
                         .wam_prelude
                         .indices
                         .get_predicate_skeleton_mut(&compilation_target, &key)
                     {
-                        Some(skeleton) => {
-                            skeleton.clauses.truncate(len);
-                            skeleton.core.clause_clause_locs.truncate(len);
-                        }
-                        None => {}
+                        skeleton.clauses.truncate(len);
+                        skeleton.core.clause_clause_locs.truncate(len);
                     }
                 }
                 RetractionRecord::SkeletonClauseStartReplaced(
@@ -919,15 +923,12 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                     target_pos,
                     clause_start,
                 ) => {
-                    match self
+                    if let Some(skeleton) = self
                         .wam_prelude
                         .indices
                         .get_predicate_skeleton_mut(&compilation_target, &key)
                     {
-                        Some(skeleton) => {
-                            skeleton.clauses[target_pos].clause_start = clause_start;
-                        }
-                        None => {}
+                        skeleton.clauses[target_pos].clause_start = clause_start;
                     }
                 }
                 RetractionRecord::RemovedDynamicSkeletonClause(
@@ -936,24 +937,22 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                     target_pos,
                     clause_clause_loc,
                 ) => {
-                    match self
+                    if let Some(skeleton) = self
                         .wam_prelude
                         .indices
                         .get_predicate_skeleton_mut(&compilation_target, &key)
                     {
-                        Some(skeleton) => {
-                            if let Some(removed_clauses) = &mut skeleton.core.retracted_dynamic_clauses {
-                                let clause_index_info = removed_clauses.pop().unwrap();
+                        if let Some(removed_clauses) = &mut skeleton.core.retracted_dynamic_clauses
+                        {
+                            let clause_index_info = removed_clauses.pop().unwrap();
 
-                                skeleton
-                                    .core
-                                    .clause_clause_locs
-                                    .insert(target_pos, clause_clause_loc);
+                            skeleton
+                                .core
+                                .clause_clause_locs
+                                .insert(target_pos, clause_clause_loc);
 
-                                skeleton.clauses.insert(target_pos, clause_index_info);
-                            }
+                            skeleton.clauses.insert(target_pos, clause_index_info);
                         }
-                        None => {}
                     }
                 }
                 RetractionRecord::RemovedSkeletonClause(
@@ -963,19 +962,16 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                     clause_index_info,
                     clause_clause_loc,
                 ) => {
-                    match self
+                    if let Some(skeleton) = self
                         .wam_prelude
                         .indices
                         .get_predicate_skeleton_mut(&compilation_target, &key)
                     {
-                        Some(skeleton) => {
-                            skeleton
-                                .core
-                                .clause_clause_locs
-                                .insert(target_pos, clause_clause_loc);
-                            skeleton.clauses.insert(target_pos, clause_index_info);
-                        }
-                        None => {}
+                        skeleton
+                            .core
+                            .clause_clause_locs
+                            .insert(target_pos, clause_clause_loc);
+                        skeleton.clauses.insert(target_pos, clause_index_info);
                     }
                 }
                 RetractionRecord::ReplacedIndexingLine(index_loc, indexing_code) => {
@@ -989,23 +985,29 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 ) => {
                     let listing_src_file_name = self.listing_src_file_name();
 
-                    match self.wam_prelude.indices.get_local_predicate_skeleton_mut(
-                        compilation_target,
-                        local_compilation_target,
-                        listing_src_file_name,
-                        key,
-                    ) {
-                        Some(skeleton) => skeleton.clause_clause_locs = clause_locs,
-                        None => {}
+                    if let Some(skeleton) =
+                        self.wam_prelude.indices.get_local_predicate_skeleton_mut(
+                            compilation_target,
+                            local_compilation_target,
+                            listing_src_file_name,
+                            key,
+                        )
+                    {
+                        skeleton.clause_clause_locs = clause_locs
                     }
                 }
                 RetractionRecord::RemovedSkeleton(compilation_target, key, skeleton) => {
                     match compilation_target {
                         CompilationTarget::User => {
-                            self.wam_prelude.indices.extensible_predicates.insert(key, skeleton);
+                            self.wam_prelude
+                                .indices
+                                .extensible_predicates
+                                .insert(key, skeleton);
                         }
                         CompilationTarget::Module(module_name) => {
-                            if let Some(module) = self.wam_prelude.indices.modules.get_mut(&module_name) {
+                            if let Some(module) =
+                                self.wam_prelude.indices.modules.get_mut(&module_name)
+                            {
                                 module.extensible_predicates.insert(key, skeleton);
                             }
                         }
@@ -1013,16 +1015,8 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 }
                 RetractionRecord::ReplacedDynamicElseOffset(instr_loc, next) => {
                     match self.wam_prelude.code[instr_loc] {
-                        Instruction::DynamicElse(
-                            _,
-                            _,
-                            NextOrFail::Next(ref mut o),
-                        )
-                        | Instruction::DynamicInternalElse(
-                            _,
-                            _,
-                            NextOrFail::Next(ref mut o),
-                        ) => {
+                        Instruction::DynamicElse(_, _, NextOrFail::Next(ref mut o))
+                        | Instruction::DynamicInternalElse(_, _, NextOrFail::Next(ref mut o)) => {
                             *o = next;
                         }
                         _ => {}
@@ -1030,16 +1024,8 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                 }
                 RetractionRecord::AppendedNextOrFail(instr_loc, fail) => {
                     match self.wam_prelude.code[instr_loc] {
-                        Instruction::DynamicElse(
-                            _,
-                            _,
-                            ref mut next_or_fail,
-                        )
-                        | Instruction::DynamicInternalElse(
-                            _,
-                            _,
-                            ref mut next_or_fail,
-                        ) => {
+                        Instruction::DynamicElse(_, _, ref mut next_or_fail)
+                        | Instruction::DynamicInternalElse(_, _, ref mut next_or_fail) => {
                             *next_or_fail = fail;
                         }
                         _ => {}
@@ -1056,7 +1042,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
         let machine_st = LS::machine_st(&mut self.payload);
         let cell = machine_st[r];
 
-        let export_list = machine_st.read_term_from_heap(cell)?;
+        let export_list = machine_st.read_term_from_heap(cell);
         let atom_tbl = &mut LS::machine_st(&mut self.payload).atom_tbl;
         let export_list = setup_module_export_list(export_list, atom_tbl)?;
 
@@ -1065,8 +1051,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
 
     fn add_clause_clause(&mut self, term: Term) -> Result<(), CompilationError> {
         match term {
-            Term::Clause(_, atom!(":-"), mut terms) if terms.len() == 2 =>
-            {
+            Term::Clause(_, atom!(":-"), mut terms) if terms.len() == 2 => {
                 let body = terms.pop().unwrap();
                 let head = terms.pop().unwrap();
 
@@ -1097,20 +1082,14 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
 
         match &compilation_target {
             CompilationTarget::User => {
-                match self
-                    .wam_prelude
-                    .indices
-                    .extensible_predicates
-                    .get_mut(&key)
-                {
+                match self.wam_prelude.indices.extensible_predicates.get_mut(&key) {
                     Some(skeleton) => {
                         if !*flag_accessor(&mut skeleton.core) {
                             *flag_accessor(&mut skeleton.core) = true;
 
-                            self.payload.retraction_info.push_record(retraction_fn(
-                                compilation_target,
-                                key,
-                            ));
+                            self.payload
+                                .retraction_info
+                                .push_record(retraction_fn(compilation_target, key));
                         }
                     }
                     None => {
@@ -1118,11 +1097,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                             let mut skeleton = PredicateSkeleton::new();
                             *flag_accessor(&mut skeleton.core) = true;
 
-                            self.add_extensible_predicate(
-                                key,
-                                skeleton,
-                                CompilationTarget::User,
-                            );
+                            self.add_extensible_predicate(key, skeleton, CompilationTarget::User);
                         } else {
                             throw_permission_error = true;
                         }
@@ -1136,10 +1111,9 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                             if !*flag_accessor(&mut skeleton.core) {
                                 *flag_accessor(&mut skeleton.core) = true;
 
-                                self.payload.retraction_info.push_record(retraction_fn(
-                                    compilation_target,
-                                    key,
-                                ));
+                                self.payload
+                                    .retraction_info
+                                    .push_record(retraction_fn(compilation_target, key));
                             }
                         }
                         None => {
@@ -1147,11 +1121,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                                 let mut skeleton = PredicateSkeleton::new();
                                 *flag_accessor(&mut skeleton.core) = true;
 
-                                self.add_extensible_predicate(
-                                    key,
-                                    skeleton,
-                                    compilation_target,
-                                );
+                                self.add_extensible_predicate(key, skeleton, compilation_target);
                             } else {
                                 throw_permission_error = true;
                             }
@@ -1163,11 +1133,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                         let mut skeleton = PredicateSkeleton::new();
                         *flag_accessor(&mut skeleton.core) = true;
 
-                        self.add_extensible_predicate(
-                            key,
-                            skeleton,
-                            compilation_target,
-                        );
+                        self.add_extensible_predicate(key, skeleton, compilation_target);
                     }
                 }
             }
@@ -1179,15 +1145,12 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
 
             match payload_compilation_target {
                 CompilationTarget::User => {
-                    match self
-                        .wam_prelude
-                        .indices
-                        .get_local_predicate_skeleton_mut(
-                            payload_compilation_target,
-                            compilation_target,
-                            listing_src_file_name,
-                            key,
-                        ) {
+                    match self.wam_prelude.indices.get_local_predicate_skeleton_mut(
+                        payload_compilation_target,
+                        compilation_target,
+                        listing_src_file_name,
+                        key,
+                    ) {
                         Some(skeleton) => {
                             if !*flag_accessor(skeleton) {
                                 *flag_accessor(skeleton) = true;
@@ -1197,11 +1160,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                             let mut skeleton = LocalPredicateSkeleton::new();
                             *flag_accessor(&mut skeleton) = true;
 
-                            self.add_local_extensible_predicate(
-                                compilation_target,
-                                key,
-                                skeleton,
-                            );
+                            self.add_local_extensible_predicate(compilation_target, key, skeleton);
                         }
                     }
                 }
@@ -1233,11 +1192,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
                             let mut skeleton = LocalPredicateSkeleton::new();
                             *flag_accessor(&mut skeleton) = true;
 
-                            self.add_local_extensible_predicate(
-                                compilation_target,
-                                key,
-                                skeleton,
-                            );
+                            self.add_local_extensible_predicate(compilation_target, key, skeleton);
                         }
                     }
                 }
@@ -1279,6 +1234,17 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
         name: Atom,
         arity: usize,
     ) -> Result<(), SessionError> {
+        let key = (name, arity);
+
+        let predicate_info = self
+            .wam_prelude
+            .indices
+            .get_predicate_skeleton(&self.payload.predicates.compilation_target, &key)
+            .map(|skeleton| skeleton.predicate_info())
+            .unwrap_or_default();
+
+        self.retract_local_clauses(&key, predicate_info.is_dynamic);
+
         self.add_extensible_predicate_declaration(
             compilation_target,
             name,
@@ -1326,10 +1292,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
             let is_dynamic = self
                 .wam_prelude
                 .indices
-                .get_predicate_skeleton(
-                    &predicates_compilation_target,
-                    &(predicate_name, arity),
-                )
+                .get_predicate_skeleton(&predicates_compilation_target, &(predicate_name, arity))
                 .map(|skeleton| skeleton.core.is_dynamic)
                 .unwrap_or(false);
 
@@ -1346,17 +1309,14 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
         let predicates_compilation_target = self.payload.predicates.compilation_target;
         let listing_src_file_name = self.listing_src_file_name();
 
-        let clause_locs = match self
-            .wam_prelude
-            .indices
-            .get_local_predicate_skeleton_mut(
-                payload_compilation_target,
-                predicates_compilation_target,
-                listing_src_file_name,
-                *key,
-            ) {
+        let clause_locs = match self.wam_prelude.indices.get_local_predicate_skeleton_mut(
+            payload_compilation_target,
+            predicates_compilation_target,
+            listing_src_file_name,
+            *key,
+        ) {
             Some(skeleton) if !skeleton.clause_clause_locs.is_empty() => {
-                mem::replace(&mut skeleton.clause_clause_locs, VecDeque::new())
+                std::mem::take(&mut skeleton.clause_clause_locs)
             }
             _ => return,
         };
@@ -1370,11 +1330,7 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
             ),
         );
 
-        self.retract_local_clauses_impl(
-            predicates_compilation_target,
-            *key,
-            &clause_locs,
-        );
+        self.retract_local_clauses_impl(predicates_compilation_target, *key, &clause_locs);
 
         if is_dynamic {
             let clause_clause_compilation_target = match predicates_compilation_target {
@@ -1389,14 +1345,15 @@ impl<'a, LS: LoadState<'a>> Loader<'a, LS> {
 
 impl<'a> MachinePreludeView<'a> {
     #[inline]
-    pub(super) fn composite_op_dir(&self, compilation_target: &CompilationTarget) -> CompositeOpDir {
+    pub(super) fn composite_op_dir(
+        &self,
+        compilation_target: &CompilationTarget,
+    ) -> CompositeOpDir {
         match compilation_target {
             CompilationTarget::User => CompositeOpDir::new(&self.indices.op_dir, None),
             CompilationTarget::Module(ref module_name) => {
                 match self.indices.modules.get(module_name) {
-                    Some(ref module) => {
-                        CompositeOpDir::new(&self.indices.op_dir, Some(&module.op_dir))
-                    }
+                    Some(module) => CompositeOpDir::new(&self.indices.op_dir, Some(&module.op_dir)),
                     None => {
                         unreachable!()
                     }
@@ -1407,9 +1364,10 @@ impl<'a> MachinePreludeView<'a> {
 }
 
 impl MachineState {
-    pub(super) fn read_term_from_heap(&mut self, term_addr: HeapCellValue) -> Result<Term, SessionError> {
+    pub(super) fn read_term_from_heap(&mut self, term_addr: HeapCellValue) -> Term {
         let mut term_stack = vec![];
-        let mut iter = stackful_post_order_iter(&mut self.heap, &mut self.stack, term_addr);
+        let mut iter =
+            stackful_post_order_iter::<NonListElider>(&mut self.heap, &mut self.stack, term_addr);
 
         while let Some(addr) = iter.next() {
             let addr = unmark_cell_bits!(addr);
@@ -1426,7 +1384,7 @@ impl MachineState {
                             term_stack.push(Term::PartialString(Cell::default(), string, tail));
                         }
                         Ok((string, None)) => {
-                            let atom = self.atom_tbl.build_with(&string);
+                            let atom = AtomTable::build_with(&self.atom_tbl, &string);
                             term_stack.push(Term::CompleteString(Cell::default(), atom));
                         }
                         Err(cons_term) => term_stack.push(cons_term),
@@ -1500,7 +1458,7 @@ impl MachineState {
         }
 
         debug_assert!(term_stack.len() == 1);
-        Ok(term_stack.pop().unwrap())
+        term_stack.pop().unwrap()
     }
 }
 
@@ -1540,9 +1498,9 @@ impl Machine {
     }
 
     pub(crate) fn load_compiled_library(&mut self) -> CallResult {
-        let library = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let library = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         if let Some(module) = self.indices.modules.get(&library) {
             if let ListingSource::DynamicallyGenerated = module.listing_src {
@@ -1573,9 +1531,9 @@ impl Machine {
     }
 
     pub(crate) fn declare_module(&mut self) -> CallResult {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let mut loader = self.loader_from_heap_evacuable(temp_v!(3));
 
@@ -1631,25 +1589,21 @@ impl Machine {
             usize,
         ) -> Result<(), SessionError>,
     ) -> CallResult {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self.deref_register(1));
 
         let compilation_target = match module_name {
             atom!("user") => CompilationTarget::User,
             _ => CompilationTarget::Module(module_name),
         };
 
-        let predicate_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[2]))
-        );
+        let predicate_name = cell_as_atom!(self.deref_register(2));
 
-        let arity = self
-            .machine_st
-            .store(self.machine_st.deref(self.machine_st.registers[3]));
-
+        let arity = self.deref_register(3);
         let arity = match Number::try_from(arity) {
-            Ok(Number::Integer(n)) if &*n >= &0 && &*n <= &MAX_ARITY => Ok(n.to_usize().unwrap()),
+            Ok(Number::Integer(n)) if *n >= Integer::ZERO && *n <= Integer::from(MAX_ARITY) => {
+                let value: usize = (&*n).try_into().unwrap();
+                Ok(value)
+            }
             Ok(Number::Fixnum(n)) if n.get_num() >= 0 && n.get_num() <= MAX_ARITY as i64 => {
                 Ok(usize::try_from(n.get_num()).unwrap())
             }
@@ -1671,7 +1625,7 @@ impl Machine {
         let mut loader = self.loader_from_heap_evacuable(temp_v!(2));
 
         let add_clause = || {
-            let term = loader.read_term_from_heap(temp_v!(1))?;
+            let term = loader.read_term_from_heap(temp_v!(1));
 
             loader.incremental_compile_clause(
                 (atom!("term_expansion"), 2),
@@ -1689,9 +1643,9 @@ impl Machine {
     }
 
     pub(crate) fn add_goal_expansion_clause(&mut self) -> CallResult {
-        let target_module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let target_module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let mut loader = self.loader_from_heap_evacuable(temp_v!(3));
 
@@ -1701,7 +1655,7 @@ impl Machine {
         };
 
         let add_clause = || {
-            let term = loader.read_term_from_heap(temp_v!(2))?;
+            let term = loader.read_term_from_heap(temp_v!(2));
 
             let indexing_arg = match term.name() {
                 Some(atom!(":-")) => term.first_arg().and_then(Term::first_arg),
@@ -1711,7 +1665,8 @@ impl Machine {
 
             if let Some(indexing_term) = indexing_arg {
                 if let Some(indexing_name) = indexing_term.name() {
-                    loader.wam_prelude
+                    loader
+                        .wam_prelude
                         .indices
                         .goal_expansion_indices
                         .insert((indexing_name, indexing_term.arity()));
@@ -1763,14 +1718,11 @@ impl Machine {
                         &ListingSource::DynamicallyGenerated,
                     );
 
-                    match loader.wam_prelude.indices.modules.get_mut(&module_name) {
-                        Some(module) => {
-                            for (key, value) in module.op_dir.drain(0..) {
-                                let mut op_decl = OpDecl::new(value, key.0);
-                                op_decl.remove(&mut loader.wam_prelude.indices.op_dir);
-                            }
+                    if let Some(module) = loader.wam_prelude.indices.modules.get_mut(&module_name) {
+                        for (key, value) in module.op_dir.drain(0..) {
+                            let mut op_decl = OpDecl::new(value, key.0);
+                            op_decl.remove(&mut loader.wam_prelude.indices.op_dir);
                         }
-                        None => {}
                     }
                 }
             }
@@ -1782,20 +1734,23 @@ impl Machine {
         self.restore_load_state_payload(result)
     }
 
-    pub(crate) fn loader_from_heap_evacuable<'a>(
-        &'a mut self,
+    pub(crate) fn loader_from_heap_evacuable(
+        &mut self,
         r: RegType,
-    ) -> Loader<'a, LiveLoadAndMachineState<'a>> {
-        let mut load_state = cell_as_load_state_payload!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st[r]))
-        );
+    ) -> Loader<'_, LiveLoadAndMachineState<'_>> {
+        let mut load_state = cell_as_load_state_payload!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st[r])));
 
         load_state.set_tag(ArenaHeaderTag::LiveLoadState);
 
         let (wam_prelude, machine_st) = self.prelude_view_and_machine_st();
 
         Loader {
-            payload: LiveLoadAndMachineState { load_state, machine_st },
+            payload: LiveLoadAndMachineState {
+                load_state,
+                machine_st,
+            },
             wam_prelude,
         }
     }
@@ -1803,26 +1758,21 @@ impl Machine {
     #[inline]
     pub(crate) fn push_load_state_payload(&mut self) {
         let payload = arena_alloc!(
-            LoadStatePayload::new(
-                self.code.len(),
-                LiveTermStream::new(ListingSource::User),
-            ),
+            LoadStatePayload::new(self.code.len(), LiveTermStream::new(ListingSource::User),),
             &mut self.machine_st.arena
         );
 
         let var = self.machine_st.deref(self.machine_st.registers[1]);
 
-        self.machine_st.bind(
-            var.as_var().unwrap(),
-            typed_arena_ptr_as_cell!(payload),
-        );
+        self.machine_st
+            .bind(var.as_var().unwrap(), typed_arena_ptr_as_cell!(payload));
     }
 
     #[inline]
     pub(crate) fn pop_load_state_payload(&mut self) {
-        let load_state_payload = self.machine_st.store(
-            self.machine_st.deref(self.machine_st.registers[1])
-        );
+        let load_state_payload = self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1]));
 
         // unlike in loader_from_heap_evacuable,
         // pop_load_state_payload is allowed to fail to find a
@@ -1860,11 +1810,10 @@ impl Machine {
             2,
         )?;
 
-        let path = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[2]))
-        );
+        let path = cell_as_atom!(self.deref_register(2));
 
-        self.load_contexts.push(LoadContext::new(path.as_str(), stream));
+        self.load_contexts
+            .push(LoadContext::new(&path.as_str(), stream));
         Ok(())
     }
 
@@ -1873,9 +1822,7 @@ impl Machine {
         result: Result<TypedArenaPtr<LiveLoadState>, SessionError>,
     ) -> CallResult {
         match result {
-            Ok(_payload) => {
-                Ok(())
-            }
+            Ok(_payload) => Ok(()),
             Err(e) => {
                 let err = self.machine_st.session_error(e);
                 let stub = functor_stub(atom!("load"), 1);
@@ -1886,8 +1833,32 @@ impl Machine {
     }
 
     pub(crate) fn scoped_clause_to_evacuable(&mut self) -> CallResult {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
+        let target = self.deref_register(1);
+
+        let mut permission_error = || {
+            let err = self.machine_st.permission_error(
+                Permission::Modify,
+                atom!("static_procedure"),
+                functor_stub(atom!(":"), 2)
+                    .into_iter()
+                    .collect::<MachineStub>(),
+            );
+
+            self.machine_st
+                .error_form(err, functor_stub(atom!("load"), 1))
+        };
+
+        let module_name = read_heap_cell!(target,
+            (HeapCellValueTag::Atom, (name, arity)) => {
+                if arity == 0 {
+                    name
+                } else {
+                    return Err(permission_error());
+                }
+            }
+            _ => {
+                return Err(permission_error());
+            }
         );
 
         let loader = self.loader_from_heap_evacuable(temp_v!(3));
@@ -1928,9 +1899,10 @@ impl Machine {
     pub(crate) fn load_context_source(&mut self) {
         if let Some(load_context) = self.load_contexts.last() {
             let path_str = load_context.path.to_str().unwrap();
-            let path_atom = self.machine_st.atom_tbl.build_with(path_str);
+            let path_atom = AtomTable::build_with(&self.machine_st.atom_tbl, path_str);
 
-            self.machine_st.unify_atom(path_atom, self.machine_st.registers[1]);
+            self.machine_st
+                .unify_atom(path_atom, self.machine_st.registers[1]);
         } else {
             self.machine_st.fail = true;
         }
@@ -1941,9 +1913,11 @@ impl Machine {
             match load_context.path.file_name() {
                 Some(file_name) if load_context.path.is_file() => {
                     let file_name_str = file_name.to_str().unwrap();
-                    let file_name_atom = self.machine_st.atom_tbl.build_with(file_name_str);
+                    let file_name_atom =
+                        AtomTable::build_with(&self.machine_st.atom_tbl, file_name_str);
 
-                    self.machine_st.unify_atom(file_name_atom, self.machine_st.registers[1]);
+                    self.machine_st
+                        .unify_atom(file_name_atom, self.machine_st.registers[1]);
                     return;
                 }
                 _ => {
@@ -1959,9 +1933,11 @@ impl Machine {
         if let Some(load_context) = self.load_contexts.last() {
             if let Some(directory) = load_context.path.parent() {
                 let directory_str = directory.to_str().unwrap();
-                let directory_atom = self.machine_st.atom_tbl.build_with(directory_str);
+                let directory_atom =
+                    AtomTable::build_with(&self.machine_st.atom_tbl, directory_str);
 
-                self.machine_st.unify_atom(directory_atom, self.machine_st.registers[1]);
+                self.machine_st
+                    .unify_atom(directory_atom, self.machine_st.registers[1]);
                 return;
             }
         }
@@ -1996,12 +1972,12 @@ impl Machine {
             _ => CompilationTarget::Module(module_name),
         };
 
-        let stub_gen = || {
-            match append_or_prepend {
-                AppendOrPrepend::Append  => functor_stub(atom!("assertz"), 1),
-                AppendOrPrepend::Prepend => functor_stub(atom!("asserta"), 1),
-            }
+        let key = match append_or_prepend {
+            AppendOrPrepend::Append => (atom!("assertz"), 1),
+            AppendOrPrepend::Prepend => (atom!("asserta"), 1),
         };
+
+        let stub_gen = || functor_stub(key.0, key.1);
 
         let head = self.deref_register(2);
 
@@ -2016,7 +1992,8 @@ impl Machine {
 
             loader.payload.compilation_target = compilation_target;
 
-            let head = LiveLoadAndMachineState::machine_st(&mut loader.payload).read_term_from_heap(head)?;
+            let head =
+                LiveLoadAndMachineState::machine_st(&mut loader.payload).read_term_from_heap(head);
 
             let name = if let Some(name) = head.name() {
                 name
@@ -2028,39 +2005,35 @@ impl Machine {
             let is_builtin = loader.wam_prelude.indices.builtin_property((name, arity));
 
             let is_dynamic_predicate = loader
-                  .wam_prelude
-                  .indices
-                  .is_dynamic_predicate(
-                      module_name,
-                      (name, arity),
-                  );
+                .wam_prelude
+                .indices
+                .is_dynamic_predicate(module_name, (name, arity));
 
-            let no_such_predicate =
-                if !is_dynamic_predicate && !is_builtin {
-                    let idx_tag = loader
-                        .wam_prelude
-                        .indices
-                        .get_predicate_code_index(
-                            name,
-                            arity,
-                            module_name,
-                        )
-                        .map(|code_idx| code_idx.get_tag())
-                        .unwrap_or(IndexPtrTag::DynamicUndefined);
+            let no_such_predicate = if !is_dynamic_predicate && !is_builtin {
+                let idx_tag = loader
+                    .wam_prelude
+                    .indices
+                    .get_predicate_code_index(name, arity, module_name)
+                    .map(|code_idx| code_idx.get_tag())
+                    .unwrap_or(IndexPtrTag::DynamicUndefined);
 
-                    idx_tag == IndexPtrTag::DynamicUndefined || idx_tag == IndexPtrTag::Undefined
-                } else if is_builtin {
-                    return Err(SessionError::CannotOverwriteBuiltIn((name, arity)));
+                if idx_tag == IndexPtrTag::Index {
+                    return Err(SessionError::CannotOverwriteStaticProcedure((name, arity)));
                 } else {
-                    is_dynamic_predicate
-                };
+                    idx_tag == IndexPtrTag::Undefined || idx_tag == IndexPtrTag::DynamicUndefined
+                }
+            } else if is_builtin {
+                return Err(SessionError::CannotOverwriteBuiltIn((name, arity)));
+            } else {
+                is_dynamic_predicate
+            };
 
             if !no_such_predicate {
                 LiveLoadAndMachineState::machine_st(&mut loader.payload).fail = true;
                 return LiveLoadAndMachineState::evacuate(loader);
             }
 
-            let body = loader.read_term_from_heap(temp_v!(3))?;
+            let body = loader.read_term_from_heap(temp_v!(3));
 
             let asserted_clause = Term::Clause(
                 Cell::default(),
@@ -2095,23 +2068,18 @@ impl Machine {
         match compile_assert() {
             Ok(_) => Ok(()),
             Err(SessionError::CompilationError(
-                CompilationError::InvalidRuleHead |
-                CompilationError::InadmissibleFact
+                CompilationError::InvalidRuleHead | CompilationError::InadmissibleFact,
             )) => {
-                let err = self.machine_st.type_error(
-                    ValidType::Callable,
-                    self.machine_st.registers[2],
-                );
+                let err = self
+                    .machine_st
+                    .type_error(ValidType::Callable, self.machine_st.registers[2]);
 
                 Err(self.machine_st.error_form(err, stub_gen()))
             }
-            Err(SessionError::CompilationError(
-                CompilationError::InadmissibleQueryTerm
-            )) => {
-                let err = self.machine_st.type_error(
-                    ValidType::Callable,
-                    self.machine_st.registers[3],
-                );
+            Err(SessionError::CompilationError(CompilationError::InadmissibleQueryTerm)) => {
+                let err = self
+                    .machine_st
+                    .type_error(ValidType::Callable, self.machine_st.registers[3]);
 
                 Err(self.machine_st.error_form(err, stub_gen()))
             }
@@ -2123,9 +2091,9 @@ impl Machine {
     }
 
     pub(crate) fn abolish_clause(&mut self) -> CallResult {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let key = self
             .machine_st
@@ -2137,8 +2105,8 @@ impl Machine {
         };
 
         let mut abolish_clause = || {
-            let mut loader: Loader<'_, LiveLoadAndMachineState<'_>>
-                = Loader::new(self, LiveTermStream::new(ListingSource::User));
+            let mut loader: Loader<'_, LiveLoadAndMachineState<'_>> =
+                Loader::new(self, LiveTermStream::new(ListingSource::User));
 
             loader.payload.compilation_target = compilation_target;
 
@@ -2158,9 +2126,11 @@ impl Machine {
                         .remove_predicate_skeleton(
                             &clause_clause_compilation_target,
                             &(atom!("$clause"), 2),
-                        ).unwrap();
+                        )
+                        .unwrap();
 
-                    let result = skeleton.core
+                    let result = skeleton
+                        .core
                         .clause_clause_locs
                         .iter()
                         .map(|clause_clause_loc| {
@@ -2170,11 +2140,7 @@ impl Machine {
                         })
                         .collect();
 
-                    loader.add_extensible_predicate(
-                        key,
-                        skeleton,
-                        compilation_target,
-                    );
+                    loader.add_extensible_predicate(key, skeleton, compilation_target);
 
                     loader.add_extensible_predicate(
                         (atom!("$clause"), 2),
@@ -2183,14 +2149,15 @@ impl Machine {
                     );
 
                     result
-                }).unwrap();
+                })
+                .unwrap();
 
-            loader.wam_prelude
+            loader
+                .wam_prelude
                 .indices
                 .remove_predicate_skeleton(&compilation_target, &key);
 
-            let mut code_index = loader
-                .get_or_insert_code_index(key, compilation_target);
+            let mut code_index = loader.get_or_insert_code_index(key, compilation_target);
 
             code_index.set(IndexPtr::undefined());
 
@@ -2223,14 +2190,17 @@ impl Machine {
             .store(self.machine_st.deref(self.machine_st[temp_v!(3)]));
 
         let target_pos = match Number::try_from(target_pos) {
-            Ok(Number::Integer(n)) => n.to_usize().unwrap(),
+            Ok(Number::Integer(n)) => {
+                let value: usize = (&*n).try_into().unwrap();
+                value
+            }
             Ok(Number::Fixnum(n)) => usize::try_from(n.get_num()).unwrap(),
             _ => unreachable!(),
         };
 
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[4]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[4])));
 
         let compilation_target = match module_name {
             atom!("user") => CompilationTarget::User,
@@ -2283,9 +2253,9 @@ impl Machine {
     }
 
     pub(crate) fn is_consistent_with_term_queue(&mut self) -> CallResult {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let key = self
             .machine_st
@@ -2300,8 +2270,8 @@ impl Machine {
 
         LiveLoadAndMachineState::machine_st(&mut loader.payload).fail =
             (!loader.payload.predicates.is_empty()
-             && loader.payload.predicates.compilation_target != compilation_target)
-             || !key.is_consistent(&loader.payload.predicates);
+                && loader.payload.predicates.compilation_target != compilation_target)
+                || !key.is_consistent(&loader.payload.predicates);
 
         let result = LiveLoadAndMachineState::evacuate(loader);
         self.restore_load_state_payload(result)
@@ -2323,9 +2293,9 @@ impl Machine {
     }
 
     pub(crate) fn remove_module_exports(&mut self) -> CallResult {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let mut loader = self.loader_from_heap_evacuable(temp_v!(2));
 
@@ -2351,9 +2321,9 @@ impl Machine {
     }
 
     pub(crate) fn meta_predicate_property(&mut self) {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let (predicate_name, arity) = self
             .machine_st
@@ -2371,9 +2341,12 @@ impl Machine {
             Some(meta_specs) => {
                 let term_loc = self.machine_st.heap.len();
 
-                self.machine_st.heap.push(atom_as_cell!(predicate_name, arity));
-                self.machine_st.heap.extend(
-                    meta_specs.iter().map(|meta_spec| match meta_spec {
+                self.machine_st
+                    .heap
+                    .push(atom_as_cell!(predicate_name, arity));
+                self.machine_st
+                    .heap
+                    .extend(meta_specs.iter().map(|meta_spec| match meta_spec {
                         MetaSpec::Minus => atom_as_cell!(atom!("+")),
                         MetaSpec::Plus => atom_as_cell!(atom!("-")),
                         MetaSpec::Either => atom_as_cell!(atom!("?")),
@@ -2381,15 +2354,20 @@ impl Machine {
                         MetaSpec::RequiresExpansionWithArgument(ref arg_num) => {
                             fixnum_as_cell!(Fixnum::build_with(*arg_num as i64))
                         }
-                    })
-                );
+                    }));
 
                 let heap_loc = self.machine_st.heap.len();
 
-                self.machine_st.heap.push(atom_as_cell!(atom!("meta_predicate"), 1));
+                self.machine_st
+                    .heap
+                    .push(atom_as_cell!(atom!("meta_predicate"), 1));
                 self.machine_st.heap.push(str_loc_as_cell!(term_loc));
 
-                unify!(self.machine_st, str_loc_as_cell!(heap_loc), self.machine_st.registers[4]);
+                unify!(
+                    self.machine_st,
+                    str_loc_as_cell!(heap_loc),
+                    self.machine_st.registers[4]
+                );
             }
             None => {
                 self.machine_st.fail = true;
@@ -2398,9 +2376,9 @@ impl Machine {
     }
 
     pub(crate) fn dynamic_property(&mut self) {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let key = self
             .machine_st
@@ -2425,9 +2403,9 @@ impl Machine {
     }
 
     pub(crate) fn multifile_property(&mut self) {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let key = self
             .machine_st
@@ -2452,9 +2430,9 @@ impl Machine {
     }
 
     pub(crate) fn discontiguous_property(&mut self) {
-        let module_name = cell_as_atom!(
-            self.machine_st.store(self.machine_st.deref(self.machine_st.registers[1]))
-        );
+        let module_name = cell_as_atom!(self
+            .machine_st
+            .store(self.machine_st.deref(self.machine_st.registers[1])));
 
         let key = self
             .machine_st
@@ -2493,7 +2471,7 @@ impl<'a> Loader<'a, LiveLoadAndMachineState<'a>> {
             self.payload.predicates.compilation_target = compilation_target;
         }
 
-        let term = self.read_term_from_heap(term_reg)?;
+        let term = self.read_term_from_heap(term_reg);
 
         self.add_clause_clause_if_dynamic(&term)?;
         self.payload.term_stream.term_queue.push_back(term);
@@ -2517,7 +2495,7 @@ pub(super) fn load_module(
 
     import_module_exports::<LiveLoadAndMachineState>(
         &mut payload,
-        &compilation_target,
+        compilation_target,
         module,
         code_dir,
         op_dir,

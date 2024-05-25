@@ -9,16 +9,17 @@ but they're not part of the ISO Prolog standard at the moment.
                     bb_put/2,
                     call_cleanup/2,
                     call_with_inference_limit/3,
+                    call_residue_vars/2,
                     forall/2,
                     partial_string/1,
                     partial_string/3,
                     partial_string_tail/2,
                     setup_call_cleanup/3,
+                    succ/2,
                     call_nth/2,
                     countall/2,
                     copy_term_nat/2,
-                    asserta/2,
-                    assertz/2]).
+		    copy_term/3]).
 
 :- use_module(library(error), [can_be/2,
                                domain_error/3,
@@ -26,6 +27,8 @@ but they're not part of the ISO Prolog standard at the moment.
                                type_error/3]).
 
 :- use_module(library(lists), [maplist/3]).
+
+:- use_module(library('$project_atts')).
 
 :- meta_predicate(forall(0, 0)).
 
@@ -109,6 +112,23 @@ bb_get(Key, Value) :-
     (  atom(Key) ->
        '$fetch_global_var'(Key, Value)
     ;  type_error(atom, Key, bb_get/2)
+    ).
+
+
+%% succ(?I, ?S).
+%
+% True iff S is the successor of the non-negative integer I.
+% At least one of the arguments must be instantiated.
+
+succ(I, S) :-
+    can_be(not_less_than_zero, I),
+    can_be(not_less_than_zero, S),
+    (   integer(S) ->
+        S > 0,
+        I is S-1
+    ;   integer(I) ->
+        S is I+1
+    ;   instantiation_error(succ/2)
     ).
 
 
@@ -196,26 +216,6 @@ run_cleaners_without_handling(Cp) :-
 
 % call_with_inference_limit
 
-:- non_counted_backtracking end_block/4.
-
-end_block(_, Bb, NBb, _L) :-
-    '$clean_up_block'(NBb),
-    '$reset_block'(Bb).
-end_block(B, _Bb, NBb, L) :-
-    '$install_inference_counter'(B, L, _),
-    '$reset_block'(NBb),
-    '$fail'.
-
-:- non_counted_backtracking handle_ile/3.
-
-handle_ile(B, inference_limit_exceeded(B), inference_limit_exceeded) :-
-    !,
-    '$pop_ball_stack'.
-handle_ile(B, _, _) :-
-    '$remove_call_policy_check'(B),
-    '$pop_from_ball_stack',
-    '$unwind_stack'.
-
 :- meta_predicate(call_with_inference_limit(0, ?, ?)).
 
 :- non_counted_backtracking call_with_inference_limit/3.
@@ -238,8 +238,6 @@ call_with_inference_limit(G, L, R) :-
     call_with_inference_limit(G, L, R, Bb, B),
     '$remove_call_policy_check'(B).
 
-install_inference_counter(B, L, Count0) :-
-    '$install_inference_counter'(B, L, Count0).
 
 :- meta_predicate(call_with_inference_limit(0,?,?,?,?)).
 
@@ -247,23 +245,34 @@ install_inference_counter(B, L, Count0) :-
 
 call_with_inference_limit(G, L, R, Bb, B) :-
     '$install_new_block'(NBb),
-    '$install_inference_counter'(B, L, Count0),
+    '$install_inference_counter'(NBb, L, Count0),
     '$call_with_inference_counting'(call(G)),
     '$inference_level'(R, B),
-    '$remove_inference_counter'(B, Count1),
+    '$remove_inference_counter'(NBb, Count1),
     Diff is L - (Count1 - Count0),
-    end_block(B, Bb, NBb, Diff).
+    (  '$clean_up_block'(NBb),
+       '$reset_block'(Bb)
+    ;  '$install_inference_counter'(NBb, Diff, _),
+       '$reset_block'(NBb),
+       '$fail'
+    ).
 call_with_inference_limit(_, _, R, Bb, B) :-
+    (  '$inference_limit_exceeded' ->
+       R = inference_limit_exceeded
+    ;  true
+    ),
+    '$get_current_block'(NBb),
+    '$remove_inference_counter'(NBb, _),
     '$reset_block'(Bb),
-    '$remove_inference_counter'(B, _),
-    (  '$get_ball'(Ball),
+    '$remove_call_policy_check'(B),
+    (  '$get_ball'(_),
        '$push_ball_stack',
        '$get_cp'(Cp),
-       '$set_cp_by_default'(Cp)
-    ;  '$remove_call_policy_check'(B),
-       '$fail'
-    ),
-    handle_ile(B, Ball, R).
+       '$set_cp_by_default'(Cp),
+       '$pop_from_ball_stack',
+       '$unwind_stack'
+    ;  nonvar(R)
+    ).
 
 %% partial_string(String, L, L0)
 %
@@ -340,10 +349,10 @@ call_nth_nesting(C, ID) :-
     bb_put(ID, 0),
     bb_put(i_call_nth_counter, C).
 
-%% countall(Goal, N).
+%% countall(G_0, N).
 %
-% countall(Goal, N) counts all solutions of Goal and unifies N with
-% this number of solutions. This predicate always succeeds once.
+% countall(G_0, N) is true iff N unifies with the total number of
+% answers of call(G_0).
 
 :- meta_predicate(countall(0, ?)).
 
@@ -352,7 +361,7 @@ countall(Goal, N) :-
     (   integer(N) ->
         (   N < 0 ->
             domain_error(not_less_than_zero, N, countall/2)
-        ;   N > 0
+        ;   true
         )
     ;   true
     ),
@@ -377,21 +386,23 @@ countall(Goal, N) :-
 copy_term_nat(Source, Dest) :-
     '$copy_term_without_attr_vars'(Source, Dest).
 
-%% asserta(Module, Rule_Fact).
+%% copy_term(+Term, -Copy, -Gs).
 %
-% Similar to `asserta/1` but allows specifying a Module
-asserta(Module, (Head :- Body)) :-
-    !,
-    '$asserta'(Module, Head, Body).
-asserta(Module, Fact) :-
-    '$asserta'(Module, Fact, true).
+% Produce a deep copy of Term and unify it to Copy, without attributes.
+% Unify Gs with a list of goals that represent the attributes of Term.
+% Similar to `copy_term/2` but splitting the attributes.
+copy_term(Term, Copy, Gs) :-
+   can_be(list, Gs),
+   findall(Term-Rs, '$project_atts':term_residual_goals(Term,Rs), [Copy-Gs]),
+   (  var(Gs) ->
+      Gs = []
+   ;  true
+   ).
 
-%% assertz(Module, Rule_Fact).
-%
-% Similar to `assertz/1` but allows specifying a Module
-assertz(Module, (Head :- Body)) :-
-    !,
-    '$assertz'(Module, Head, Body).
-assertz(Module, Fact) :-
-    '$assertz'(Module, Fact, true).
+:- meta_predicate call_residue_vars(0, ?).
 
+call_residue_vars(Goal, Vars) :-
+    can_be(list, Vars),
+    '$get_attr_var_queue_delim'(B),
+    call(Goal),
+    '$get_attr_var_queue_beyond'(B, Vars).

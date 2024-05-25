@@ -1,3 +1,12 @@
+# Announcing the Scryer Prolog Meetup 2024
+
+This year we will meet at the Hotel Stefanie in Vienna to discuss
+present and future developments in the Scryer Prolog system.
+
+Details here: [https://www.digitalaustria.gv.at/eng/insights/Digital-Austria-Events-EN/Scryer-Prolog-Meetup-2024.html](https://www.digitalaustria.gv.at/eng/insights/Digital-Austria-Events-EN/Scryer-Prolog-Meetup-2024.html).
+
+Many thanks to the Austrian Federal Ministry of Finance for hosting
+the event!
 
 # Scryer Prolog
 
@@ -6,7 +15,10 @@ source industrial strength production environment that is also a
 testbed for bleeding edge research in logic and constraint
 programming, which is itself written in a high-level language.
 
-As of July 2023, **Scryer Prolog passes all [syntactic conformity&nbsp;tests](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/conformity_testing)**.
+**Scryer Prolog passes all tests** of
+[syntactic&nbsp;conformity](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/conformity_testing),
+[`variable_names/1`](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/variable_names) and
+[`dif/2`](https://www.complang.tuwien.ac.at/ulrich/iso-prolog/dif).
 
 The homepage of the project is: [**https://www.scryer.pl**](https://www.scryer.pl)
 
@@ -105,7 +117,14 @@ strings.
 
 ## Installing Scryer Prolog
 
-### Native Install
+### Binaries
+
+Precompiled binaries for several platforms are available for download
+at:
+
+**https://github.com/mthom/scryer-prolog/releases/tag/v0.9.3**
+
+### Native Compilation
 
 First, install the latest stable version of
 [Rust](https://www.rust-lang.org/en-US/install.html) using your
@@ -143,7 +162,78 @@ light.exe scryer-prolog.wixobj
 ```
 It will generate a very basic MSI file which installs the main executable and a shortcut in the Start Menu. It can be installed with a double-click. To uninstall, go to the Control Panel and uninstall as usual.
 
-Scryer Prolog must be built with **Rust 1.63 and up**.
+Scryer Prolog must be built with **Rust 1.70 and up**.
+
+### Building WebAssembly
+
+Scryer Prolog has basic WebAssembly support. You can follow `wasm-pack`'s [official instructions](https://rustwasm.github.io/docs/wasm-pack/quickstart.html) to install `wasm-pack` and build it in any way you like.
+
+However, none of the [default features](https://doc.rust-lang.org/cargo/reference/features.html#the-default-feature) are currently supported. The preferred way of disabling them is passing [extra options](https://rustwasm.github.io/wasm-pack/book/commands/build.html#extra-options) to `wasm-pack`.
+
+For example, if you want a minimal working package without using any bundler like `webpack`, you can do this:
+```
+wasm-pack build --target web -- --no-default-features
+```
+Then a `pkg` directory will be created, containing everything you need for a webapp. You can test whether the package is successfully built by creating an html file, adapted from `wasm-bindgen`'s [official example](https://rustwasm.github.io/wasm-bindgen/examples/without-a-bundler.html) like this:
+
+```html
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8" />
+        <title>Scryer Prolog - Sudoku Solver Example</title>
+        <script type="module">
+        import init, { eval_code } from './pkg/scryer_prolog.js';
+
+        const run = async () => {
+            await init("./pkg/scryer_prolog_bg.wasm");
+            let code = `
+            :- use_module(library(format)).
+            :- use_module(library(clpz)).
+            :- use_module(library(lists)).
+            
+            sudoku(Rows) :-
+            length(Rows, 9), maplist(same_length(Rows), Rows),
+            append(Rows, Vs), Vs ins 1..9,
+            maplist(all_distinct, Rows),
+            transpose(Rows, Columns),
+            maplist(all_distinct, Columns),
+            Rows = [As,Bs,Cs,Ds,Es,Fs,Gs,Hs,Is],
+            blocks(As, Bs, Cs),
+            blocks(Ds, Es, Fs),
+            blocks(Gs, Hs, Is).
+            
+            blocks([], [], []).
+            blocks([N1,N2,N3|Ns1], [N4,N5,N6|Ns2], [N7,N8,N9|Ns3]) :-
+            all_distinct([N1,N2,N3,N4,N5,N6,N7,N8,N9]),
+            blocks(Ns1, Ns2, Ns3).
+            
+            problem(1, [[_,_,_,_,_,_,_,_,_],
+                        [_,_,_,_,_,3,_,8,5],
+                        [_,_,1,_,2,_,_,_,_],
+                        [_,_,_,5,_,7,_,_,_],
+                        [_,_,4,_,_,_,1,_,_],
+                        [_,9,_,_,_,_,_,_,_],
+                        [5,_,_,_,_,_,_,7,3],
+                        [_,_,2,_,1,_,_,_,_],
+                        [_,_,_,_,4,_,_,_,9]]).
+            
+            main :-
+            problem(1, Rows), sudoku(Rows), maplist(portray_clause, Rows).
+            
+            :- initialization(main).
+            `;
+            const result = eval_code(code);
+            document.write(`<p>Sudoku solver returns:</p><pre>${result}</pre>`);
+        }
+        run();
+        </script>    
+    </head>
+    <body></body>
+</html>
+```
+
+Then you can serve it with your favorite http server like `python -m http.server` or `npx serve`, and access the page with your browser.
 
 ### Docker Install
 
@@ -235,6 +325,35 @@ To quit Scryer Prolog, use the standard predicate `halt/0`:
 ?- halt.
 ```
 
+### Starting Scryer Prolog
+
+Scryer Prolog can be started from the command line by specifying
+options, files and additional arguments. All components are optional:
+
+<pre>
+scryer-prolog [OPTIONS] [FILES] [-- ARGUMENTS]
+</pre>
+
+The supported options are:
+
+```
+   -h, --help             Display help message
+   -v, --version          Print version information and exit
+   -g, --goal GOAL        Run the query GOAL after consulting files
+   -f                     Fast startup. Do not load initialization file (~/.scryerrc)
+   --no-add-history       Prevent adding input to history file (~/.scryer_history)
+```
+
+All specified Prolog files are consulted.
+
+After Prolog files, application-specific arguments can be specified on
+the command line. These arguments can be accessed from within Prolog
+applications with the predicate&nbsp;`argv/1`, which yields the list
+of arguments represented as strings.
+
+Prolog files can also be turned into *shell&nbsp;scripts* as explained in
+https://github.com/mthom/scryer-prolog/issues/2170#issuecomment-1821713993.
+
 ### Dynamic operators
 
 Scryer supports dynamic operators. Using the built-in
@@ -285,14 +404,14 @@ innovations of Scryer Prolog. This means that terms which appear as
 lists of characters to Prolog programs are stored in packed
 UTF-8&nbsp;encoding by the engine.
 
-Without this innovation, storing a list of characters in memory
-would use one memory&nbsp;cell per character, one memory&nbsp;cell per
-list constructor, and one memory&nbsp;cell for each tail that occurs
-in the list. Since one memory&nbsp;cell takes 8&nbsp;bytes on 64-bit
-machines, the packed representation used by Scryer&nbsp;Prolog yields
-an up&nbsp;to **24-fold&nbsp;reduction** of memory usage, and
-corresponding reduction of memory&nbsp;accesses when creating and
-processing strings.
+Without this innovation, storing a list of characters in memory would
+use one WAM memory&nbsp;cell per character, one cell per list
+constructor, and one cell for each tail that occurs in the list. Since
+one cell takes 8&nbsp;bytes in the WAM as implemented by
+Scryer&nbsp;Prolog, the packed representation yields an up&nbsp;to
+**24-fold&nbsp;reduction** of memory usage, and corresponding
+reduction of memory&nbsp;accesses when creating and processing
+strings.
 
 Scryer Prolog's compact internal string representation makes it
 ideally suited for the use case Prolog was originally developed for:
@@ -546,7 +665,7 @@ The modules that ship with Scryer&nbsp;Prolog are also called
   Probabilistic predicates and random number generators.
 * [`http/http_open`](src/lib/http/http_open.pl) Open a stream to
   read answers from web&nbsp;servers. HTTPS is also supported.
-* [`http/http_server`](src/lib/http/http_server.pl) Runs a HTTP/1.1 and HTTP/2.0 web server. Uses [Hyper](https://hyper.rs) as a backend. Supports some query and form handling.
+* [`http/http_server`](src/lib/http/http_server.pl) Runs a HTTP/1.1 and HTTP/2.0 web server. Uses [Warp](https://github.com/seanmonstar/warp) as a backend. Supports some query and form handling.
 * [`sgml`](src/lib/sgml.pl)
   `load_html/3` and `load_xml/3` represent HTML and XML&nbsp;documents
   as Prolog&nbsp;terms for convenient and efficient reasoning. Use
@@ -694,7 +813,9 @@ Analysis of Grants](https://www.brz.gv.at/en/BRZ-Tech-Blog/Tech-Blog-7-Symbolic-
 by the Austrian Federal Computing Center, and parts of the
 [precautionary](https://github.com/dcnorris/precautionary/tree/main/exec/prolog)
 package for the analysis of dose-escalation trials in the
-safety-critical and highly regulated domain of clinical&nbsp;oncology.
+safety-critical and highly regulated domain of oncology
+trial&nbsp;design, described in [*An Executable Specification of
+Oncology Dose-Escalation Protocols with&nbsp;Prolog*](https://arxiv.org/abs/2402.08334).
 
 Scryer Prolog is also very well suited for teaching and learning
 Prolog, and for testing syntactic conformance and hence portability of

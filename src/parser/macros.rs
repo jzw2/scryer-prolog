@@ -7,13 +7,14 @@ macro_rules! char_class {
 #[macro_export]
 macro_rules! alpha_char {
     ($c: expr) => {
-        (!$c.is_numeric() &&
-         !$c.is_whitespace() &&
-         !$c.is_control() &&
-         !$crate::graphic_token_char!($c) &&
-         !$crate::layout_char!($c) &&
-         !$crate::meta_char!($c) &&
-         !$crate::solo_char!($c)) || $c == '_'
+        (!$c.is_numeric()
+            && !$c.is_whitespace()
+            && !$c.is_control()
+            && !$crate::graphic_token_char!($c)
+            && !$crate::layout_char!($c)
+            && !$crate::meta_char!($c)
+            && !$crate::solo_char!($c))
+            || $c == '_'
     };
 }
 
@@ -76,7 +77,7 @@ macro_rules! cut_char {
 #[macro_export]
 macro_rules! decimal_digit_char {
     ($c: expr) => {
-        ('0'..='9').contains(&$c)
+        $c.is_ascii_digit()
     };
 }
 
@@ -124,14 +125,14 @@ macro_rules! graphic_token_char {
 #[macro_export]
 macro_rules! hexadecimal_digit_char {
     ($c: expr) => {
-        ('0'..='9').contains(&$c) || ('A'..='F').contains(&$c) || ('a'..='f').contains(&$c)
+        $c.is_ascii_digit() || ('A'..='F').contains(&$c) || ('a'..='f').contains(&$c)
     };
 }
 
 #[macro_export]
 macro_rules! layout_char {
     ($c: expr) => {
-        $crate::char_class!($c, [' ', '\n', '\t', '\u{0B}', '\u{0C}'])
+        $crate::char_class!($c, [' ', '\r', '\n', '\t', '\u{0B}', '\u{0C}'])
     };
 }
 

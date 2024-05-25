@@ -1,7 +1,7 @@
 use proc_macro2::TokenStream;
-use syn::*;
 use syn::parse::*;
 use syn::visit::*;
+use syn::*;
 
 use indexmap::IndexSet;
 
@@ -11,7 +11,9 @@ struct StaticStrVisitor {
 
 impl StaticStrVisitor {
     fn new() -> Self {
-        Self { static_strs: IndexSet::new() }
+        Self {
+            static_strs: IndexSet::new(),
+        }
     }
 }
 
@@ -33,7 +35,7 @@ impl Parse for ReadHeapCellExprAndArms {
         arms.push(input.parse()?);
 
         while !input.is_empty() {
-            if let Ok(_) = input.parse::<Token![,]>() {}
+            let _ = input.parse::<Token![,]>();
             arms.push(input.parse()?);
         }
 
@@ -50,7 +52,7 @@ impl Parse for MacroFnArgs {
         }
 
         while !input.is_empty() {
-            if let Ok(_) = input.parse::<Token![,]>() {}
+            let _ = input.parse::<Token![,]>();
             args.push(input.parse()?);
         }
 
@@ -63,22 +65,20 @@ impl<'ast> Visit<'ast> for StaticStrVisitor {
         let Macro { path, .. } = m;
 
         if path.is_ident("atom") {
-            if let Some(Lit::Str(string)) = m.parse_body::<Lit>().ok() {
+            if let Ok(Lit::Str(string)) = m.parse_body::<Lit>() {
                 self.static_strs.insert(string.value());
             }
         } else if path.is_ident("read_heap_cell") || path.is_ident("match_untyped_arena_ptr") {
-            if let Some(m) = m.parse_body::<ReadHeapCellExprAndArms>().ok() {
+            if let Ok(m) = m.parse_body::<ReadHeapCellExprAndArms>() {
                 self.visit_expr(&m.expr);
 
                 for e in m.arms {
                     self.visit_arm(&e);
                 }
             }
-        } else {
-            if let Some(m) = m.parse_body::<MacroFnArgs>().ok() {
-                for e in m.args {
-                    self.visit_expr(&e);
-                }
+        } else if let Ok(m) = m.parse_body::<MacroFnArgs>() {
+            for e in m.args {
+                self.visit_expr(&e);
             }
         }
     }
@@ -145,12 +145,11 @@ pub fn index_static_strings(instruction_rs_path: &std::path::Path) -> TokenStrea
         visitor.visit_file(&syntax);
     }
 
-    match process_filepath(instruction_rs_path) {
-        Ok(syntax) => visitor.visit_file(&syntax),
-        Err(_) => {}
+    if let Ok(syntax) = process_filepath(instruction_rs_path) {
+        visitor.visit_file(&syntax)
     }
 
-    let indices = (0..visitor.static_strs.len()).map(|i| i << 3);
+    let indices = (0..visitor.static_strs.len()).map(|i| (i << 3) as u64);
     let indices_iter = indices.clone();
 
     let static_strs_len = visitor.static_strs.len();
@@ -159,7 +158,7 @@ pub fn index_static_strings(instruction_rs_path: &std::path::Path) -> TokenStrea
     quote! {
         use phf;
 
-        static STRINGS: [&'static str; #static_strs_len] = [
+        static STRINGS: [&str; #static_strs_len] = [
             #(
                 #static_strs,
             )*

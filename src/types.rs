@@ -24,7 +24,7 @@ pub enum HeapCellValueTag {
     PStrOffset = 0b001111,
     // constants.
     Cons = 0b0,
-    F64  = 0b010001,
+    F64 = 0b010001,
     Fixnum = 0b010011,
     Char = 0b010101,
     Atom = 0b010111,
@@ -45,7 +45,7 @@ pub enum HeapCellValueView {
     PStrOffset = 0b001111,
     // constants.
     Cons = 0b0,
-    F64  = 0b010001,
+    F64 = 0b010001,
     Fixnum = 0b010011,
     Char = 0b010101,
     Atom = 0b010111,
@@ -56,9 +56,9 @@ pub enum HeapCellValueView {
     TrailedHeapVar = 0b101111,
     TrailedStackVar = 0b101011,
     TrailedAttrVar = 0b100001,
-    TrailedAttrVarListLink =  0b100011,
-    TrailedAttachedValue =    0b100101,
-    TrailedBlackboardEntry =  0b100111,
+    TrailedAttrVarListLink = 0b100011,
+    TrailedAttachedValue = 0b100101,
+    TrailedBlackboardEntry = 0b100111,
     TrailedBlackboardOffset = 0b110011,
 }
 
@@ -88,6 +88,15 @@ impl ConsPtr {
             .with_tag(tag)
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[inline(always)]
+    pub fn as_ptr(self) -> *mut u8 {
+        let bytes = self.into_bytes();
+        let raw_ptr_bytes = [bytes[1], bytes[2], bytes[3], bytes[4]];
+        unsafe { mem::transmute(raw_ptr_bytes) }
+    }
+
+    #[cfg(target_pointer_width = "64")]
     #[inline(always)]
     pub fn as_ptr(self) -> *mut u8 {
         self.ptr() as *mut _
@@ -112,28 +121,24 @@ pub(crate) enum RefTag {
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Ref {
     val: B56,
-    #[allow(unused)] m: bool,
-    #[allow(unused)] f: bool,
+    #[allow(unused)]
+    m: bool,
+    #[allow(unused)]
+    f: bool,
     tag: RefTag,
 }
 
 impl Ord for Ref {
     fn cmp(&self, rhs: &Ref) -> Ordering {
         match self.get_tag() {
-            RefTag::HeapCell | RefTag::AttrVar => {
-                match rhs.get_tag() {
-                    RefTag::StackCell => Ordering::Less,
-                    _ => self.get_value().cmp(&rhs.get_value()),
-                }
-            }
-            RefTag::StackCell => {
-                match rhs.get_tag() {
-                    RefTag::StackCell =>
-                        self.get_value().cmp(&rhs.get_value()),
-                    _ =>
-                        Ordering::Greater,
-                }
-            }
+            RefTag::HeapCell | RefTag::AttrVar => match rhs.get_tag() {
+                RefTag::StackCell => Ordering::Less,
+                _ => self.get_value().cmp(&rhs.get_value()),
+            },
+            RefTag::StackCell => match rhs.get_tag() {
+                RefTag::StackCell => self.get_value().cmp(&rhs.get_value()),
+                _ => Ordering::Greater,
+            },
         }
     }
 }
@@ -189,15 +194,16 @@ pub enum TrailRef {
     BlackboardOffset(Atom, HeapCellValue), // key atom, key value
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(BitfieldSpecifier, Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[bits = 6]
 pub(crate) enum TrailEntryTag {
     TrailedHeapVar = 0b101111,
     TrailedStackVar = 0b101011,
     TrailedAttrVar = 0b100001,
-    TrailedAttrVarListLink =  0b100011,
-    TrailedAttachedValue =    0b100101,
-    TrailedBlackboardEntry =  0b100111,
+    TrailedAttrVarListLink = 0b100011,
+    TrailedAttachedValue = 0b100101,
+    TrailedBlackboardEntry = 0b100111,
     TrailedBlackboardOffset = 0b110011,
 }
 
@@ -206,9 +212,12 @@ pub(crate) enum TrailEntryTag {
 #[repr(u64)]
 pub(crate) struct TrailEntry {
     val: B56,
-    #[allow(unused)] f: bool,
-    #[allow(unused)] m: bool,
-    #[allow(unused)] tag: TrailEntryTag,
+    #[allow(unused)]
+    f: bool,
+    #[allow(unused)]
+    m: bool,
+    #[allow(unused)]
+    tag: TrailEntryTag,
 }
 
 impl TrailEntry {
@@ -224,9 +233,9 @@ impl TrailEntry {
     #[inline(always)]
     pub(crate) fn get_tag(self) -> TrailEntryTag {
         match self.tag_or_err() {
-	        Ok(tag) => tag,
-	        Err(_) => TrailEntryTag::TrailedAttachedValue,
-	    }
+            Ok(tag) => tag,
+            Err(_) => TrailEntryTag::TrailedAttachedValue,
+        }
     }
 
     #[inline]
@@ -248,14 +257,13 @@ pub struct HeapCellValue {
 impl fmt::Debug for HeapCellValue {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> fmt::Result {
         match self.get_tag() {
-            HeapCellValueTag::F64 => {
-                f.debug_struct("HeapCellValue")
-                    .field("tag", &HeapCellValueTag::F64)
-                    .field("offset", &self.get_value())
-                    .field("m", &self.m())
-                    .field("f", &self.f())
-                    .finish()
-            }
+            HeapCellValueTag::F64 => f
+                .debug_struct("HeapCellValue")
+                .field("tag", &HeapCellValueTag::F64)
+                .field("offset", &self.get_value())
+                .field("m", &self.m())
+                .field("f", &self.f())
+                .finish(),
             HeapCellValueTag::Cons => {
                 let cons_ptr = ConsPtr::from_bytes(self.into_bytes());
 
@@ -267,8 +275,7 @@ impl fmt::Debug for HeapCellValue {
                     .finish()
             }
             HeapCellValueTag::Atom => {
-                let (name, arity) = cell_as_atom_cell!(self)
-                     .get_name_and_arity();
+                let (name, arity) = cell_as_atom_cell!(self).get_name_and_arity();
 
                 f.debug_struct("HeapCellValue")
                     .field("tag", &HeapCellValueTag::Atom)
@@ -279,8 +286,7 @@ impl fmt::Debug for HeapCellValue {
                     .finish()
             }
             HeapCellValueTag::PStr => {
-                let (name, _) = cell_as_atom_cell!(self)
-                     .get_name_and_arity();
+                let (name, _) = cell_as_atom_cell!(self).get_name_and_arity();
 
                 f.debug_struct("HeapCellValue")
                     .field("tag", &HeapCellValueTag::PStr)
@@ -289,14 +295,13 @@ impl fmt::Debug for HeapCellValue {
                     .field("f", &self.f())
                     .finish()
             }
-            tag => {
-                f.debug_struct("HeapCellValue")
-                    .field("tag", &tag)
-                    .field("value", &self.get_value())
-                    .field("m", &self.get_mark_bit())
-                    .field("f", &self.get_forwarding_bit())
-                    .finish()
-            }
+            tag => f
+                .debug_struct("HeapCellValue")
+                .field("tag", &tag)
+                .field("value", &self.get_value())
+                .field("m", &self.get_mark_bit())
+                .field("f", &self.get_forwarding_bit())
+                .finish(),
         }
     }
 }
@@ -311,10 +316,7 @@ impl<T: ArenaAllocated> From<TypedArenaPtr<T>> for HeapCellValue {
 impl From<F64Ptr> for HeapCellValue {
     #[inline]
     fn from(f64_ptr: F64Ptr) -> HeapCellValue {
-        HeapCellValue::build_with(
-            HeapCellValueTag::F64,
-            f64_ptr.as_offset().to_u64(),
-        )
+        HeapCellValue::build_with(HeapCellValueTag::F64, f64_ptr.as_offset().to_u64())
     }
 }
 
@@ -330,7 +332,7 @@ impl From<ConsPtr> for HeapCellValue {
     }
 }
 
-impl<'a> From<(Number, &mut Arena)> for HeapCellValue {
+impl From<(Number, &mut Arena)> for HeapCellValue {
     #[inline(always)]
     fn from((n, arena): (Number, &mut Arena)) -> HeapCellValue {
         use ordered_float::OrderedFloat;
@@ -392,12 +394,16 @@ impl HeapCellValue {
 
     #[inline]
     pub fn is_ref(self) -> bool {
-        match self.get_tag() {
-            HeapCellValueTag::Str | HeapCellValueTag::Lis | HeapCellValueTag::Var |
-            HeapCellValueTag::StackVar | HeapCellValueTag::AttrVar | HeapCellValueTag::PStrLoc |
-            HeapCellValueTag::PStrOffset => true,
-            _ => false,
-        }
+        matches!(
+            self.get_tag(),
+            HeapCellValueTag::Str
+                | HeapCellValueTag::Lis
+                | HeapCellValueTag::Var
+                | HeapCellValueTag::StackVar
+                | HeapCellValueTag::AttrVar
+                | HeapCellValueTag::PStrLoc
+                | HeapCellValueTag::PStrOffset
+        )
     }
 
     #[inline]
@@ -422,16 +428,14 @@ impl HeapCellValue {
     #[inline]
     pub fn is_constant(self) -> bool {
         match self.get_tag() {
-            HeapCellValueTag::Cons | HeapCellValueTag::F64 | HeapCellValueTag::Fixnum |
-            HeapCellValueTag::Char | HeapCellValueTag::CStr => {
-                true
-            }
-            HeapCellValueTag::Atom => {
-                cell_as_atom_cell!(self).get_arity() == 0
-            }
-            _ => {
-                false
-            }
+            HeapCellValueTag::Cons
+            | HeapCellValueTag::F64
+            | HeapCellValueTag::Fixnum
+            | HeapCellValueTag::CutPoint
+            | HeapCellValueTag::Char
+            | HeapCellValueTag::CStr => true,
+            HeapCellValueTag::Atom => cell_as_atom_cell!(self).get_arity() == 0,
+            _ => false,
         }
     }
 
@@ -444,19 +448,15 @@ impl HeapCellValue {
     pub fn is_compound(self, heap: &[HeapCellValue]) -> bool {
         match self.get_tag() {
             HeapCellValueTag::Str => {
-                cell_as_atom_cell!(heap[self.get_value()]).get_arity() > 0
+                cell_as_atom_cell!(heap[self.get_value() as usize]).get_arity() > 0
             }
-            HeapCellValueTag::Lis |
-            HeapCellValueTag::CStr |
-            HeapCellValueTag::PStr |
-            HeapCellValueTag::PStrLoc |
-            HeapCellValueTag::PStrOffset => {
-               true
-            }
-            HeapCellValueTag::Atom => {
-                cell_as_atom_cell!(self).get_arity() > 0
-            }
-            _ => { false }
+            HeapCellValueTag::Lis
+            | HeapCellValueTag::CStr
+            | HeapCellValueTag::PStr
+            | HeapCellValueTag::PStrLoc
+            | HeapCellValueTag::PStrOffset => true,
+            HeapCellValueTag::Atom => cell_as_atom_cell!(self).get_arity() > 0,
+            _ => false,
         }
     }
 
@@ -491,13 +491,13 @@ impl HeapCellValue {
     }
 
     #[inline]
-    pub fn get_value(self) -> usize {
-        self.val() as usize
+    pub fn get_value(self) -> u64 {
+        self.val()
     }
 
     #[inline]
-    pub fn set_value(&mut self, val: usize) {
-        self.set_val(val as u64);
+    pub fn set_value(&mut self, val: u64) {
+        self.set_val(val);
     }
 
     #[inline]
@@ -513,7 +513,7 @@ impl HeapCellValue {
     #[inline]
     pub fn to_atom(self) -> Option<Atom> {
         match self.tag() {
-            HeapCellValueTag::Atom => Some(Atom::from((self.val() << 3) as usize)),
+            HeapCellValueTag::Atom => Some(Atom::from(self.val() << 3)),
             _ => None,
         }
     }
@@ -521,9 +521,7 @@ impl HeapCellValue {
     #[inline]
     pub fn to_pstr(self) -> Option<PartialString> {
         match self.tag() {
-            HeapCellValueTag::PStr => {
-                Some(PartialString::from(Atom::from((self.val() as usize) << 3)))
-            }
+            HeapCellValueTag::PStr => Some(PartialString::from(Atom::from(self.val() << 3))),
             _ => None,
         }
     }
@@ -536,10 +534,50 @@ impl HeapCellValue {
         }
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[inline]
+    pub fn from_raw_ptr_bytes(ptr_bytes: [u8; 4]) -> Self {
+        HeapCellValue::from_bytes([
+            ptr_bytes[0],
+            ptr_bytes[1],
+            ptr_bytes[2],
+            ptr_bytes[3],
+            0,
+            0,
+            0,
+            0,
+        ])
+    }
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    pub fn from_raw_ptr_bytes(ptr_bytes: [u8; 8]) -> Self {
+        HeapCellValue::from_bytes(ptr_bytes)
+    }
+
+    #[inline]
+    #[cfg(target_pointer_width = "32")]
+    pub fn to_raw_ptr_bytes(self) -> [u8; 4] {
+        let bytes = self.into_bytes();
+        [bytes[0], bytes[1], bytes[2], bytes[3]]
+    }
+
+    #[inline]
+    #[cfg(target_pointer_width = "64")]
+    pub fn to_raw_ptr_bytes(self) -> [u8; 8] {
+        self.into_bytes()
+    }
+
+    #[inline]
+    pub fn to_untyped_arena_ptr_bytes(self) -> [u8; 8] {
+        self.into_bytes()
+    }
+
     #[inline]
     pub fn to_untyped_arena_ptr(self) -> Option<UntypedArenaPtr> {
-        match self.tag() {
-            HeapCellValueTag::Cons => Some(UntypedArenaPtr::from_bytes(self.into_bytes())),
+        match self.get_tag() {
+            HeapCellValueTag::Cons => Some(UntypedArenaPtr::from_bytes(
+                self.to_untyped_arena_ptr_bytes(),
+            )),
             _ => None,
         }
     }
@@ -548,7 +586,7 @@ impl HeapCellValue {
     pub fn get_forwarding_bit(self) -> bool {
         match self.get_tag() {
             HeapCellValueTag::Cons => ConsPtr::from_bytes(self.into_bytes()).f(),
-            _ => self.f()
+            _ => self.f(),
         }
     }
 
@@ -566,9 +604,7 @@ impl HeapCellValue {
     #[inline(always)]
     pub fn get_mark_bit(self) -> bool {
         match self.get_tag() {
-            HeapCellValueTag::Cons => {
-                ConsPtr::from_bytes(self.into_bytes()).m()
-            }
+            HeapCellValueTag::Cons => ConsPtr::from_bytes(self.into_bytes()).m(),
             _ => self.m(),
         }
     }
@@ -595,19 +631,16 @@ impl HeapCellValue {
                     Some(TermOrderCategory::Variable)
                 }
                 HeapCellValueTag::Char => Some(TermOrderCategory::Atom),
-                HeapCellValueTag::Atom => {
-                    Some(if cell_as_atom_cell!(self).get_arity() > 0 {
-                        TermOrderCategory::Compound
-                    } else {
-                        TermOrderCategory::Atom
-                    })
-                }
-                HeapCellValueTag::Lis | HeapCellValueTag::PStrLoc |
-                HeapCellValueTag::CStr => {
+                HeapCellValueTag::Atom => Some(if cell_as_atom_cell!(self).get_arity() > 0 {
+                    TermOrderCategory::Compound
+                } else {
+                    TermOrderCategory::Atom
+                }),
+                HeapCellValueTag::Lis | HeapCellValueTag::PStrLoc | HeapCellValueTag::CStr => {
                     Some(TermOrderCategory::Compound)
                 }
                 HeapCellValueTag::Str => {
-                    let value = heap[self.get_value()];
+                    let value = heap[self.get_value() as usize];
                     let arity = cell_as_atom_cell!(value).get_arity();
 
                     if arity == 0 {
@@ -616,9 +649,7 @@ impl HeapCellValue {
                         Some(TermOrderCategory::Compound)
                     }
                 }
-                _ => {
-                    None
-                }
+                _ => None,
             },
         }
     }
@@ -642,9 +673,18 @@ const_assert!(mem::size_of::<HeapCellValue>() == 8);
 #[repr(u64)]
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct UntypedArenaPtr {
+    #[allow(unused)]
     ptr: B61,
     m: bool,
-    #[allow(unused)] padding: B2,
+    #[allow(unused)]
+    padding: B2,
+}
+
+impl UntypedArenaPtr {
+    #[inline(always)]
+    pub fn build_with(ptr: usize) -> Self {
+        UntypedArenaPtr::new().with_ptr(ptr as u64)
+    }
 }
 
 const_assert!(mem::size_of::<UntypedArenaPtr>() == 8);
@@ -652,21 +692,21 @@ const_assert!(mem::size_of::<UntypedArenaPtr>() == 8);
 impl From<*const ArenaHeader> for UntypedArenaPtr {
     #[inline]
     fn from(ptr: *const ArenaHeader) -> UntypedArenaPtr {
-        unsafe { mem::transmute(ptr) }
+        UntypedArenaPtr::build_with(ptr as usize)
     }
 }
 
 impl From<*const IndexPtr> for UntypedArenaPtr {
     #[inline]
     fn from(ptr: *const IndexPtr) -> UntypedArenaPtr {
-        unsafe { mem::transmute(ptr) }
+        UntypedArenaPtr::build_with(ptr as usize)
     }
 }
 
 impl From<UntypedArenaPtr> for *const ArenaHeader {
     #[inline]
     fn from(ptr: UntypedArenaPtr) -> *const ArenaHeader {
-        unsafe { mem::transmute(ptr) }
+        ptr.get_ptr() as *const ArenaHeader
     }
 }
 
@@ -676,6 +716,15 @@ impl UntypedArenaPtr {
         self.set_m(m);
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[inline]
+    pub fn get_ptr(self) -> *const u8 {
+        let bytes = self.into_bytes();
+        let raw_ptr_bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        unsafe { mem::transmute(raw_ptr_bytes) }
+    }
+
+    #[cfg(target_pointer_width = "64")]
     #[inline]
     pub fn get_ptr(self) -> *const u8 {
         self.ptr() as *const u8
@@ -684,17 +733,14 @@ impl UntypedArenaPtr {
     #[inline]
     pub fn get_tag(self) -> ArenaHeaderTag {
         unsafe {
-            let header = *(self.ptr() as *const ArenaHeader);
+            let header = *(self.get_ptr() as *const ArenaHeader);
             header.get_tag()
         }
     }
 
     #[inline]
     pub fn payload_offset(self) -> *const u8 {
-        unsafe {
-            self.get_ptr()
-                .offset(mem::size_of::<ArenaHeader>() as isize)
-        }
+        unsafe { self.get_ptr().add(mem::size_of::<ArenaHeader>()) }
     }
 
     #[inline]
@@ -708,17 +754,15 @@ impl Add<usize> for HeapCellValue {
 
     fn add(self, rhs: usize) -> Self::Output {
         match self.get_tag() {
-            tag @ HeapCellValueTag::Str |
-            tag @ HeapCellValueTag::Lis |
-            tag @ HeapCellValueTag::PStrOffset |
-            tag @ HeapCellValueTag::PStrLoc |
-            tag @ HeapCellValueTag::Var |
-            tag @ HeapCellValueTag::AttrVar => {
-                HeapCellValue::build_with(tag, (self.get_value() + rhs) as u64)
+            tag @ HeapCellValueTag::Str
+            | tag @ HeapCellValueTag::Lis
+            | tag @ HeapCellValueTag::PStrOffset
+            | tag @ HeapCellValueTag::PStrLoc
+            | tag @ HeapCellValueTag::Var
+            | tag @ HeapCellValueTag::AttrVar => {
+                HeapCellValue::build_with(tag, (self.get_value() as usize + rhs) as u64)
             }
-            _ => {
-                self
-            }
+            _ => self,
         }
     }
 }
@@ -728,17 +772,15 @@ impl Sub<usize> for HeapCellValue {
 
     fn sub(self, rhs: usize) -> Self::Output {
         match self.get_tag() {
-            tag @ HeapCellValueTag::Str |
-            tag @ HeapCellValueTag::Lis |
-            tag @ HeapCellValueTag::PStrOffset |
-            tag @ HeapCellValueTag::PStrLoc |
-            tag @ HeapCellValueTag::Var |
-            tag @ HeapCellValueTag::AttrVar => {
-                HeapCellValue::build_with(tag, (self.get_value() - rhs) as u64)
+            tag @ HeapCellValueTag::Str
+            | tag @ HeapCellValueTag::Lis
+            | tag @ HeapCellValueTag::PStrOffset
+            | tag @ HeapCellValueTag::PStrLoc
+            | tag @ HeapCellValueTag::Var
+            | tag @ HeapCellValueTag::AttrVar => {
+                HeapCellValue::build_with(tag, (self.get_value() as usize - rhs) as u64)
             }
-            _ => {
-                self
-            }
+            _ => self,
         }
     }
 }
@@ -756,21 +798,18 @@ impl Sub<i64> for HeapCellValue {
     fn sub(self, rhs: i64) -> Self::Output {
         if rhs < 0 {
             match self.get_tag() {
-                tag @ HeapCellValueTag::Str |
-                tag @ HeapCellValueTag::Lis |
-                tag @ HeapCellValueTag::PStrOffset |
-                tag @ HeapCellValueTag::PStrLoc |
-                tag @ HeapCellValueTag::Var |
-                tag @ HeapCellValueTag::AttrVar => {
-                    HeapCellValue::build_with(tag, (self.get_value() + rhs.abs() as usize) as u64)
+                tag @ HeapCellValueTag::Str
+                | tag @ HeapCellValueTag::Lis
+                | tag @ HeapCellValueTag::PStrOffset
+                | tag @ HeapCellValueTag::PStrLoc
+                | tag @ HeapCellValueTag::Var
+                | tag @ HeapCellValueTag::AttrVar => {
+                    HeapCellValue::build_with(tag, self.get_value() + rhs.unsigned_abs())
                 }
-                _ => {
-                    self
-                }
+                _ => self,
             }
         } else {
             self.sub(rhs as usize)
         }
     }
 }
-

@@ -1,8 +1,4 @@
-#[cfg(feature = "num-rug-adapter")]
-pub use num_rug_adapter as rug;
-
-#[cfg(feature = "rug")]
-pub use rug;
+pub use dashu;
 
 // #[macro_use]
 // extern crate lazy_static;
@@ -15,4 +11,5 @@ pub mod ast;
 #[macro_use]
 pub mod macros;
 pub mod lexer;
+#[allow(clippy::module_inception)]
 pub mod parser;
